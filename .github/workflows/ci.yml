@@ -4,7 +4,7 @@ on:
   # trigger ran every PR commit twice. Master, release topics, and tags keep
   # push runs because RELEASING.md's preflight and tag checks need them.
   push:
-    branches: ['master', 'brb/release-*']
+    branches: ['fabric']
     tags: ['v*']
   pull_request:
 

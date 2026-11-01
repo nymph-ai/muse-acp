@@ -105,18 +105,18 @@ class ArchiveValidation(unittest.TestCase):
 
 
 class TagOnlyRelease(unittest.TestCase):
-    def test_master_push_with_released_version_is_a_no_op(self):
-        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+    def test_fabric_push_with_released_version_is_a_no_op(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/fabric'}
         with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
             self.assertTrue(release.preflight_superseded())
 
-    def test_unreleased_version_on_master_is_still_checked(self):
-        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+    def test_unreleased_version_on_fabric_is_still_checked(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/fabric'}
         with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value=None):
             self.assertFalse(release.preflight_superseded())
 
     def test_release_branches_and_tags_keep_the_strict_check(self):
-        for ref in ['refs/heads/brb/release-9.9.9', 'refs/tags/' + release.TAG]:
+        for ref in ['refs/heads/master', 'refs/heads/brb/release-9.9.9', 'refs/tags/' + release.TAG]:
             env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': ref}
             with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
                 self.assertFalse(release.preflight_superseded(), ref)
