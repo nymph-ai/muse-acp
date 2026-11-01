@@ -13,13 +13,17 @@ import tempfile
 import tomllib
 import zipfile
 
-REPO = 'BrokkAi/muse-acp'
+REPO = 'nymph-ai/muse-acp'
 INSTALLERS = ['install.sh', 'install.ps1']
 TARGETS = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
            'x86_64-apple-darwin', 'aarch64-apple-darwin',
            'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc']
 VERSION = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
-TAG = os.environ.get('RELEASE_TAG', 'v' + VERSION)
+# A fork release is the upstream version it is based on plus FORK_RELEASE
+# (FORK.md): v0.20.0-nymph.2 is the fork's second release on 0.20.0.
+FORK_RELEASE = Path('FORK_RELEASE').read_text().strip()
+FORK_TAG = f'v{VERSION}-{FORK_RELEASE}'
+TAG = os.environ.get('RELEASE_TAG', FORK_TAG)
 SHA = os.environ.get('RELEASE_COMMIT') or subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 
 
@@ -50,7 +54,7 @@ def optional(path):
 
 
 def metadata():
-    require(TAG == 'v' + VERSION, 'Tag does not match Cargo version')
+    require(TAG == FORK_TAG, 'Tag does not match Cargo version and FORK_RELEASE')
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == SHA, 'Wrong checkout commit')
     require(not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no']), 'Tracked inputs are dirty')
 
@@ -164,11 +168,11 @@ def tag_check():
 
 
 def preflight_superseded():
-    # After a release, master keeps the released version until the next bump.
+    # After a release, fabric keeps the released version until the next bump.
     # Its pushes have nothing to publish, so the publisher preflight passes as
     # a no-op instead of failing on the existing tag. Release topic branches,
     # dispatches, and tag pushes keep the strict check.
-    if os.environ.get('GITHUB_EVENT_NAME') != 'push' or os.environ.get('GITHUB_REF') != 'refs/heads/master':
+    if os.environ.get('GITHUB_EVENT_NAME') != 'push' or os.environ.get('GITHUB_REF') != 'refs/heads/fabric':
         return False
     commit = tag_commit()
     return commit is not None and commit != SHA
@@ -191,7 +195,7 @@ def find_release(tag):
     if matches:
         return api('releases/' + str(matches[0]['id']))
     # The CLI's draft lookup also uses GraphQL when REST omits the draft.
-    query = 'query($tag:String!) { repository(owner:"BrokkAi", name:"muse-acp") { release(tagName:$tag) { databaseId } } }'
+    query = 'query($tag:String!) { repository(owner:"nymph-ai", name:"muse-acp") { release(tagName:$tag) { databaseId } } }'
     result = json.loads(gh('api', '--hostname', 'github.com', 'graphql',
                            '-f', 'query=' + query, '-f', 'tag=' + tag))
     require(not result.get('errors'), 'GraphQL draft lookup failed')
