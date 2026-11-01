@@ -2778,6 +2778,8 @@ fn mcp_config_field(servers: Option<&str>) -> String {
 /// with (MSP has no unload), so a different set is rejected as
 /// `session_configuration_conflict`. Retry once without configuration: the
 /// session attaches with the servers it has instead of becoming unusable.
+/// A resume refused `sessionInUse` asks for the session's drive and is sent
+/// again.
 fn resume_session(
     host: &Arc<Hosts>,
     msp_sid: &str,
@@ -2802,6 +2804,18 @@ fn resume_session(
                 mcp_config_field(servers)
             ),
         )
+    };
+    // Another client of a shared `muse serve` (Muse's own app attached to
+    // the session) may drive it; the host then refuses the resume
+    // `sessionInUse`. Ask for the drive once and resume again, as a refused
+    // turn does (`turn_command`).
+    let send = |servers: Option<&str>| match send(servers) {
+        Err(e) if err_code(&e) == -32021 => match take_drive(host, msp_sid) {
+            DriveAnswer::Granted => send(servers),
+            DriveAnswer::Busy(holder) => Err(drive_kept_error(e, holder.as_deref())),
+            DriveAnswer::Refused => Err(e),
+        },
+        result => result,
     };
     match send(mcp_servers) {
         Err(e) if mcp_servers.is_some() && msp::is_session_configuration_conflict(&e) => {

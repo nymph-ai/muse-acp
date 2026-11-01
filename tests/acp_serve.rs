@@ -6737,6 +6737,50 @@ fn idle_steering_takes_back_the_drive() {
     c.finish();
 }
 
+/// The ACP `session/load` the adapter's client sends again after a restart.
+fn load_after_drive_taken(scenario: &str) -> (String, Vec<String>) {
+    let mut c = Client::spawn(scenario, &[]);
+    let sid = c.new_session(1, "");
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    let lid = c.req(
+        "session/load",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            cwd.to_str().expect("utf8 cwd").replace('\\', "\\\\")
+        ),
+    );
+    let load = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log)
+        .unwrap()
+        .lines()
+        .filter(|m| matches!(*m, "session/resume" | "session/requestDrive"))
+        .map(str::to_string)
+        .collect();
+    c.finish();
+    (load, calls)
+}
+
+#[test]
+fn load_takes_back_a_drive_another_client_took() {
+    let (load, calls) = load_after_drive_taken("drive_taken");
+    assert!(load.contains("\"result\""), "the load succeeds: {load}");
+    // A usage backfill (the snapshot rung) may resume once more afterwards.
+    assert_eq!(
+        calls[..3],
+        ["session/resume", "session/requestDrive", "session/resume"]
+    );
+}
+
+#[test]
+fn load_keeps_the_refusal_when_the_drive_is_not_granted() {
+    let (load, calls) = load_after_drive_taken("drive_busy");
+    assert!(load.contains("already in use"), "the host refusal: {load}");
+    assert_eq!(calls, ["session/resume", "session/requestDrive"]);
+}
+
 #[test]
 fn unknown_native_skill_preserves_typed_host_error() {
     let mut c = Client::spawn("skill_not_found", &[]);

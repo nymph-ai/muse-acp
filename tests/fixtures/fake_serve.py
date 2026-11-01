@@ -297,7 +297,8 @@ FEEDBACK = [False]
 SESSION_RENAME = [False]
 MCP_CONFLICTED = [False]
 # drive_taken / drive_busy: another client of a shared `muse serve` holds the
-# session's drive, so turns are refused `sessionInUse` until it is requested.
+# session's drive, so turns and resumes are refused `sessionInUse` until it is
+# requested.
 DRIVE_TAKEN = [SCENARIO in ("drive_taken", "drive_busy")]
 # FAKE_DRIVE_LOST_AFTER_TURN=1: another client takes the drive once the first
 # turn is admitted.
@@ -3609,7 +3610,7 @@ def main():
                             "driveHolder": {"name": "muse_acp", "version": "1"},
                             "previousDriveHolder": {"name": "tbh_tui", "version": "1"}})
                     continue
-                if DRIVE_TAKEN[0] and method in ("turn/start", "turn/steer"):
+                if DRIVE_TAKEN[0] and method in ("turn/start", "turn/steer", "session/resume"):
                     # Muse 1.4.14's refusal to a client that does not drive.
                     log_input(msg.get("params", {}))
                     sid = msg.get("params", {}).get("sessionId", "")
