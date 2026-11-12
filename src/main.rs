@@ -952,13 +952,14 @@ fn send_session_projection(
     status: Option<&str>,
     attention: Option<&[String]>,
 ) {
-    let ver = {
+    let (ver, settling) = {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let Some(s) = map.get_mut(acp_sid) else {
             return;
         };
         acp::send_session_status(stdout, s, status, attention);
-        s.ver
+        // Foreground work whose terminal the adapter has not handled yet.
+        (s.ver, s.active_turn.is_some() || !s.in_flight.is_empty())
     };
     if ver == 2 {
         if attention.is_some_and(|flags| !flags.is_empty()) {
@@ -966,7 +967,14 @@ fn send_session_projection(
         } else {
             match status {
                 Some("running") => acp::send_state(stdout, acp_sid, "running", None),
-                Some("idle") => acp::send_state(stdout, acp_sid, "idle", None),
+                // The host's status reaches idle before the turn's terminal
+                // does. An idle sent here would be the first after running
+                // and say nothing of why the work stopped; the terminal's
+                // own idle, which does, would then read as a repeated
+                // snapshot, and a client that ends the turn at the first
+                // idle took a cancelled turn for a completed one
+                // (nymph-ai/nymphai#7283). The terminal sends it.
+                Some("idle") if !settling => acp::send_state(stdout, acp_sid, "idle", None),
                 _ => {}
             }
         }

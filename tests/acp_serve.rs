@@ -10895,6 +10895,40 @@ fn a_reissued_resolved_approval_after_resume_stays_closed() {
     c.finish();
 }
 
+/// The host's status reaches idle before a turn's terminal does. The first
+/// idle a v2 client sees after running is the one that says why the work
+/// stopped: a client that ends the turn there must not take a cancelled
+/// turn for a completed one (nymph-ai/nymphai#7283).
+#[test]
+fn v2_first_idle_after_a_turn_carries_its_stop_reason() {
+    for (terminal, reason) in [("cancelled", "cancelled"), ("completed", "end_turn")] {
+        let mut c = Client::spawn("idle_before_terminal", &[("FAKE_TERMINAL", terminal)]);
+        let sid = c.new_session(2, "");
+        // Counted from before the prompt is sent: the host may report the
+        // turn's status before it has answered the turn's start.
+        let sent = c.frames.lock().unwrap_or_else(|p| p.into_inner()).len();
+        let pid = c.prompt(&sid, "work");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        c.wait_for(
+            &format!("\"stopReason\":\"{reason}\""),
+            Duration::from_secs(15),
+        );
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let idles: Vec<&String> = frames[sent..]
+            .iter()
+            .filter(|f| f.contains("\"state_update\"") && f.contains("\"state\":\"idle\""))
+            .collect();
+        let first = idles
+            .first()
+            .unwrap_or_else(|| panic!("{terminal}: no idle after the prompt: {frames:?}"));
+        assert!(
+            first.contains(&format!("\"stopReason\":\"{reason}\"")),
+            "{terminal}: the first idle says why the work stopped: {idles:?}"
+        );
+        c.finish();
+    }
+}
+
 #[test]
 fn status_changed_seeds_and_targets_session_attention() {
     let mut c = Client::spawn("status_flags", &[]);
