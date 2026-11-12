@@ -10904,17 +10904,17 @@ fn v2_first_idle_after_a_turn_carries_its_stop_reason() {
     for (terminal, reason) in [("cancelled", "cancelled"), ("completed", "end_turn")] {
         let mut c = Client::spawn("idle_before_terminal", &[("FAKE_TERMINAL", terminal)]);
         let sid = c.new_session(2, "");
+        // Counted from before the prompt is sent: the host may report the
+        // turn's status before it has answered the turn's start.
+        let sent = c.frames.lock().unwrap_or_else(|p| p.into_inner()).len();
         let pid = c.prompt(&sid, "work");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
         c.wait_for(
             &format!("\"stopReason\":\"{reason}\""),
             Duration::from_secs(15),
         );
         let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let accepted = frames
-            .iter()
-            .position(|f| f.contains(&format!("\"id\":{pid}")))
-            .unwrap_or_else(|| panic!("{terminal}: the prompt was not answered: {frames:?}"));
-        let idles: Vec<&String> = frames[accepted..]
+        let idles: Vec<&String> = frames[sent..]
             .iter()
             .filter(|f| f.contains("\"state_update\"") && f.contains("\"state\":\"idle\""))
             .collect();
