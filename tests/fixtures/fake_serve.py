@@ -60,6 +60,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   foreground_then_retracted turn/foregroundCompleted, then turn/retracted
   deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  idle_before_terminal session/statusChanged running then idle, then the
+                        terminal FAKE_TERMINAL names (default completed)
   subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
   subagent_child_approval child approval without displayable choices
   host_exit_classified exit after a turn/start ack with FAKE_HOST_EXIT_CODE
@@ -1030,6 +1032,17 @@ def on_turn_start(params):
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "idle_before_terminal":
+        # A real host's order: the folded status is idle before the turn's
+        # terminal record is delivered.
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "running", "attention": [],
+            "viewCursor": "cur-idle-1"})
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "idle", "attention": [],
+            "viewCursor": "cur-idle-2"})
+        notify("turn/completed", {
+            **base, "terminal": os.environ.get("FAKE_TERMINAL", "completed")})
     elif SCENARIO == "status_flags":
         notify("session/statusChanged", {
             "sessionId": MSP_SID, "status": "paused",
