@@ -4791,13 +4791,32 @@ fn accept_v2_prompt(
     sid: &str,
     content: &out::Echo,
 ) {
-    let msg_id = mint_id("msg-", &ID_COUNTER);
+    accept_v2_prompt_as(
+        stdout,
+        prompt_req,
+        sid,
+        &mint_id("msg-", &ID_COUNTER),
+        content,
+    );
+}
+
+/// Accept an ACP v2 prompt under a given message id. A prompt that became a
+/// host turn is accepted under that turn command's id: the host records it
+/// on the user message it retains, and a replay names the message by it
+/// (`SessionFold::message_id`).
+fn accept_v2_prompt_as(
+    stdout: &StdoutShared,
+    prompt_req: &Option<RequestId>,
+    sid: &str,
+    msg_id: &str,
+    content: &out::Echo,
+) {
     acp::send_response(
         stdout,
         prompt_req,
-        agent_client_protocol::v2::schema::PromptResponse::new(msg_id.clone()),
+        agent_client_protocol::v2::schema::PromptResponse::new(msg_id.to_string()),
     );
-    send_user_message(stdout, sid, &msg_id, content);
+    send_user_message(stdout, sid, msg_id, content);
 }
 
 /// Answer an ACP v2 prompt that was cancelled before its message was
@@ -6995,11 +7014,11 @@ fn handle_acp(
                         // Accepted: the inserted message's id, then the
                         // user-message echo under that id (v2 MUST), then
                         // running.
-                        accept_v2_prompt(stdout, &id, &sid, &acp_content);
+                        accept_v2_prompt_as(stdout, &id, &sid, &cmd, &acp_content);
                         acp::send_state(stdout, &sid, "running", None);
                     } else {
                         // v1 prompt flow echoes user content as chunks.
-                        send_v1_user_message(stdout, &sid, &acp_content);
+                        send_user_message(stdout, &sid, &cmd, &acp_content);
                     }
                     // v1: the prompt response arrives with the terminal.
                 }
