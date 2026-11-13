@@ -11520,6 +11520,50 @@ fn goal_timestamps_pass_through_verbatim_and_are_never_invented() {
 }
 
 #[test]
+fn a_leave_rejected_as_busy_is_asked_again() {
+    // nymph-ai/nymphai#7432: Muse 1.4.18 can reject a leave `runtime_busy`,
+    // retryable, and accept it a moment later. One refusal used to leave
+    // the session loaded until Muse's own idle unload.
+    for (busy, leaves, released) in [(2, 3, true), (9, 5, false)] {
+        let rejections = busy.to_string();
+        let mut c = Client::spawn(
+            "quiet",
+            &[
+                ("FAKE_SERVER_VERSION", "1.4.18-R8587.1"),
+                ("FAKE_LEAVE_OUTCOME", "released"),
+                ("FAKE_LEAVE_BUSY", rejections.as_str()),
+            ],
+        );
+        let sid = c.new_session(2, "");
+        let id = c.req("session/close", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let closed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(closed.contains("\"result\":{}"), "{closed}");
+        if released {
+            c.wait_stderr(
+                &format!("session/leaveCompleted session={sid} outcome=released"),
+                Duration::from_secs(15),
+            );
+        } else {
+            c.wait_stderr(
+                &format!("session/leave refused session={sid}"),
+                Duration::from_secs(15),
+            );
+        }
+        let requests = host_requests(&c, "session/leave");
+        assert_eq!(requests.len(), leaves, "{requests:?}");
+        // Each attempt is a command of its own.
+        let mut commands: Vec<_> = requests
+            .iter()
+            .map(|r| r["commandId"].to_string())
+            .collect();
+        commands.sort();
+        commands.dedup();
+        assert_eq!(commands.len(), leaves, "{requests:?}");
+        c.finish();
+    }
+}
+
+#[test]
 fn closing_a_session_releases_it_on_muse_1_4_11() {
     for (version, outcome, leaves) in [
         ("1.4.11-R6667.1", "released", true),

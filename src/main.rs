@@ -11046,36 +11046,58 @@ fn answer_delete_waiters(
 /// than relying on the omitted default. The ack only admits the command; the
 /// release (or failure) arrives as `session/leaveCompleted`. The session
 /// stays in `session/list` as not loaded, and a resume reloads it.
+const LEAVE_ATTEMPTS: u32 = 5;
+
 fn leave_session(host: &Arc<Hosts>, msp_sid: &str) {
     if !host.handshake().at_least(1, 4, 11) {
         return;
     }
-    let cmd = host.mint_cmd("cmd-");
-    LEAVES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(cmd.clone(), msp_sid.to_string());
-    match host.command(
-        "session/leave",
-        &format!(
-            "{{\"commandId\":{},\"sessionId\":{},\"stop\":true}}",
-            esc(&cmd),
-            esc(msp_sid)
-        ),
-    ) {
-        Ok(_) => log(&format!(
-            "session/leave admitted session={msp_sid} command={cmd}"
-        )),
-        Err(error) => {
-            LEAVES
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&cmd);
+    // Muse 1.4.18 can reject a leave as `runtime_busy`, which it marks
+    // retryable, when it follows straight on other work of the session; a
+    // moment later it accepts. It is asked again a few times, each under a
+    // command id of its own.
+    for attempt in 1..=LEAVE_ATTEMPTS {
+        let cmd = host.mint_cmd("cmd-");
+        LEAVES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(cmd.clone(), msp_sid.to_string());
+        let error = match host.command(
+            "session/leave",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"stop\":true}}",
+                esc(&cmd),
+                esc(msp_sid)
+            ),
+        ) {
+            Ok(_) => {
+                log(&format!(
+                    "session/leave admitted session={msp_sid} command={cmd}"
+                ));
+                return;
+            }
+            Err(error) => error,
+        };
+        LEAVES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&cmd);
+        let busy = msp::rejection_reason(&error) == Some("runtime_busy")
+            && error
+                .get("data")
+                .and_then(|data| data.get("retryable"))
+                .is_some_and(|retryable| matches!(retryable, J::Bool(true)));
+        if !busy || attempt == LEAVE_ATTEMPTS {
             log(&format!(
                 "session/leave refused session={msp_sid}: {}; Muse keeps it loaded until idle",
                 err_message(&error)
             ));
+            return;
         }
+        log(&format!(
+            "session/leave rejected runtime_busy session={msp_sid}; asking again"
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
     }
 }
 
