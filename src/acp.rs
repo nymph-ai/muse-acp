@@ -1432,6 +1432,10 @@ pub fn config_options(
             ],
         }
     };
+    // A select offers at least one value (ACP v2 `SessionConfigSelectOptions`):
+    // while the host lists no model (an unresolved catalog, a provider without
+    // models) there is no model selector.
+    let model_selectable = !models.is_empty();
     out::ConfigOptions::new(
         ver,
         vec![
@@ -1499,7 +1503,10 @@ pub fn config_options(
                 },
                 meta: reasoning_meta,
             },
-        ],
+        ]
+        .into_iter()
+        .filter(|option| model_selectable || option.id != "model")
+        .collect(),
     )
 }
 
