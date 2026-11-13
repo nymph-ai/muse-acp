@@ -19,6 +19,7 @@ released upstream in v0.21.0 and dropped):
 | A resume refused `sessionInUse` (ACP `session/load`, the re-attach after a host restart) asks for the drive once and resumes again (nymph-ai/nymphai#5818) | none yet |
 | While a turn is still to settle, the host's idle status is not sent as a v2 `state_update`: the first idle after a turn is the terminal's, with its stop reason (nymph-ai/nymphai#7283) | none yet |
 | A message keeps one id live and on every replay: a user message the id of the turn command that inserted it, any other message its host item id (nymph-ai/nymphai#7283) | none yet |
+| No model selector while the host lists no model: a select with no option is not valid ACP v2 (nymph-ai/nymphai#7283) | none yet |
 | Releases are published from `fabric` under fork tags, with no npm package (this file, `FORK_RELEASE`, `scripts/release.py`, the workflows) | fork only |
 
 An upstream pull is a courtesy. Nothing here waits for one to merge; when
