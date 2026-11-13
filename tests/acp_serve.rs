@@ -6251,6 +6251,13 @@ fn model_catalog_retains_success_on_failure_but_accepts_empty_snapshot() {
                 expect_model,
                 "v{ver} catalog refresh {step}: {frame}"
             );
+            // With no model to select there is no model selector: a select
+            // with no option is not a valid one (nymph-ai/nymphai#7283).
+            assert_eq!(
+                frame.contains("\"category\":\"model\""),
+                expect_model,
+                "v{ver} catalog refresh {step}: {frame}"
+            );
         }
         let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
         assert!(log.contains("model/list returned no models array"));
