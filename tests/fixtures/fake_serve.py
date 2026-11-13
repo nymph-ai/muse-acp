@@ -785,7 +785,8 @@ def patch_document():
 
 def history_items():
     return [
-        {"itemId": "h-1", "kind": "userMessage", "text": "old question"},
+        {"itemId": "h-1", "kind": "userMessage", "commandId": "h-cmd-1",
+         "text": "old question"},
         {"itemId": "h-2", "kind": "agentMessage", "text": "old answer"},
         {"itemId": "h-3", "kind": "toolCall", "callId": "h-call",
          "status": "completed", "tool": "read",

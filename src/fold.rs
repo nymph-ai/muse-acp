@@ -2703,6 +2703,25 @@ impl SessionFold {
             .unwrap_or("")
     }
 
+    /// The ACP id of a host message item: the same while it streams and on
+    /// every later replay, so a client that keeps messages by id shows a
+    /// resumed conversation once. A user message is known by the `commandId`
+    /// of the turn command that inserted it, because a prompt is answered
+    /// with its message's id before the host has recorded an item. Any other
+    /// message is known by its `itemId`.
+    fn message_id(item: &J, idc: &AtomicU64) -> String {
+        let named = |key: &str| {
+            item.get(key)
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+        };
+        let user = item.get("kind").and_then(|v| v.as_str()) == Some("userMessage");
+        user.then(|| named("commandId"))
+            .flatten()
+            .or_else(|| named("itemId"))
+            .map_or_else(|| mint_id("msg-", idc), str::to_string)
+    }
+
     /// `cut_off` names the item when the replayed reply carries the cut-off
     /// mark, and `phase` carries its declared message phase; both ride the
     /// message itself. A settled agent-message replay carries its phase; an
@@ -2871,7 +2890,7 @@ impl SessionFold {
                 self.done.insert(item_id.clone());
                 let text = Self::message_text(item);
                 if !text.is_empty() {
-                    let msg_id = mint_id("msg-", &self.idc);
+                    let msg_id = Self::message_id(item, &self.idc);
                     let mark = self.claim_cut_off(item, &item_id);
                     let phase = (kind == "agentMessage").then(|| Self::message_phase(item));
                     out.push(Self::replay_message_line(
@@ -3207,7 +3226,7 @@ impl SessionFold {
             }
             "agentMessage" | "userMessage" => {
                 if !self.items.contains_key(&item_id) {
-                    let msg_id = mint_id("msg-", &self.idc);
+                    let msg_id = Self::message_id(item, &self.idc);
                     self.items.insert(
                         item_id,
                         ItemRole::Message {
@@ -3220,7 +3239,7 @@ impl SessionFold {
             }
             "reasoning" => {
                 if !self.items.contains_key(&item_id) {
-                    let msg_id = mint_id("thought-", &self.idc);
+                    let msg_id = Self::message_id(item, &self.idc);
                     self.items.insert(
                         item_id,
                         ItemRole::Thought {
@@ -3724,7 +3743,10 @@ impl SessionFold {
                 // Deltas are authoritative-in-motion; the completed frame is the
                 // truth. Resend only if nothing streamed (missed deltas).
                 let shown = if streamed == 0 && !text.is_empty() {
-                    Some((msg_id.unwrap_or_else(|| mint_id("msg-", &self.idc)), text))
+                    Some((
+                        msg_id.unwrap_or_else(|| Self::message_id(item, &self.idc)),
+                        text,
+                    ))
                 } else {
                     msg_id.filter(|_| streamed > 0).map(|id| (id, ""))
                 };
@@ -3777,7 +3799,7 @@ impl SessionFold {
                     _ => 0,
                 };
                 if streamed == 0 && !text.is_empty() {
-                    let msg_id = mint_id("thought-", &self.idc);
+                    let msg_id = Self::message_id(item, &self.idc);
                     out.push(Self::thought_chunk(acp_sid, ver, &msg_id, text));
                 }
                 self.items.remove(&item_id);

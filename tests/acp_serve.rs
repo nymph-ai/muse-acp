@@ -7725,6 +7725,60 @@ fn v2_resume_snapshots_state_after_replay_and_before_the_response() {
 }
 
 #[test]
+fn a_replay_names_each_message_as_it_was_named_live() {
+    // nymph-ai/nymphai#7283: a retained message keeps its id. Ids minted per
+    // process made a resumed conversation appear twice to a client that
+    // keeps messages by id.
+    //
+    // Live: the prompt is accepted under its turn command's id, which the
+    // host keeps on the user message it records, and the reply is named by
+    // its host item.
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "hi");
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let user = extract_str(&accepted, "messageId").expect("messageId");
+    c.wait_input(
+        &format!("\"commandId\": \"{user}\""),
+        Duration::from_secs(15),
+    );
+    let reply = c.wait_for("hello from fake host", Duration::from_secs(15));
+    assert_eq!(
+        extract_str(&reply, "messageId").as_deref(),
+        Some("it-1"),
+        "{reply}"
+    );
+    c.wait_for("\"idle\"", Duration::from_secs(15));
+    c.finish();
+
+    // Replayed, by two adapter processes: the user message by the command id
+    // on its retained item, the reply by its item.
+    for _ in 0..2 {
+        let mut c = Client::spawn("quiet", &[]);
+        c.initialize(2, "");
+        let id = c.req(
+            "session/resume",
+            r#"{"sessionId":"msp-sess-1","replayFrom":{"type":"start"}}"#,
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{frame}");
+        let question = c.wait_for("old question", Duration::from_secs(15));
+        assert_eq!(
+            extract_str(&question, "messageId").as_deref(),
+            Some("h-cmd-1"),
+            "{question}"
+        );
+        let answer = c.wait_for("old answer", Duration::from_secs(15));
+        assert_eq!(
+            extract_str(&answer, "messageId").as_deref(),
+            Some("h-2"),
+            "{answer}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn v2_resume_snapshot_reports_running_work() {
     let mut c = Client::spawn("resume_active", &[]);
     c.initialize(2, "");
