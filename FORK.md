@@ -20,6 +20,7 @@ released upstream in v0.21.0 and dropped):
 | While a turn is still to settle, the host's idle status is not sent as a v2 `state_update`: the first idle after a turn is the terminal's, with its stop reason (nymph-ai/nymphai#7283) | none yet |
 | A message keeps one id live and on every replay: a user message the id of the turn command that inserted it, any other message its host item id (nymph-ai/nymphai#7283) | none yet |
 | No model selector while the host lists no model: a select with no option is not valid ACP v2 (nymph-ai/nymphai#7283) | none yet |
+| A `session/leave` rejected `runtime_busy`, retryable (Muse 1.4.18), is asked again, up to five times (nymph-ai/nymphai#7432) | none yet |
 | Releases are published from `fabric` under fork tags, with no npm package (this file, `FORK_RELEASE`, `scripts/release.py`, the workflows) | fork only |
 
 An upstream pull is a courtesy. Nothing here waits for one to merge; when
@@ -34,7 +35,7 @@ this repository: pushing `fabric` runs the `ci` and `release` preflights, and
 pushing the tag at that commit publishes the six archives
 (`muse-acp-<tag>-<target>`) and their checksums. To cut one:
 
-1. Land the change on `fabric` and bump `FORK_RELEASE` (`nymph.3` to `nymph.4`)
+1. Land the change on `fabric` and bump `FORK_RELEASE` (`nymph.4` to `nymph.5`)
    in the same push. Wait for that commit's `ci` and `release` push runs.
 2. `git tag -a v<version>-<FORK_RELEASE> -m ... <commit>` and push the tag.
 
