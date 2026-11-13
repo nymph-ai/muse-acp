@@ -298,6 +298,9 @@ SESSION_MCP = [False]
 FEEDBACK = [False]
 SESSION_RENAME = [False]
 MCP_CONFLICTED = [False]
+# FAKE_LEAVE_BUSY=N rejects the first N `session/leave` commands as Muse
+# 1.4.18 does straight after other work: runtime_busy, retryable.
+LEAVE_BUSY = [int(os.environ.get("FAKE_LEAVE_BUSY", "0"))]
 # drive_taken / drive_busy: another client of a shared `muse serve` holds the
 # session's drive, so turns and resumes are refused `sessionInUse` until it is
 # requested.
@@ -3362,6 +3365,18 @@ def main():
                                         "data": {"kind": "capabilityRequired",
                                                  "capability": "sessionMcp",
                                                  "retryable": False}}})
+                        continue
+                    if method == "session/leave" and LEAVE_BUSY[0] > 0:
+                        LEAVE_BUSY[0] -= 1
+                        command = msg["params"].get("commandId", "")
+                        log_input(msg["params"])
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32030,
+                                        "message": "session/leave command " + command + " rejected: runtime_busy",
+                                        "data": {"kind": "commandRejected",
+                                                 "commandId": command,
+                                                 "reason": "runtime_busy",
+                                                 "retryable": True}}})
                         continue
                     if (method == "session/resume" and not MCP_CONFLICTED[0]
                             and os.environ.get("FAKE_MCP_CONFLICT") == "1"):
