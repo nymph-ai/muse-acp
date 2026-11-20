@@ -9,6 +9,82 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::RequestId;
 use crate::out::Echo;
+use crate::request::{Block, Content};
+
+/// The ordinary v2 content that can use MSP's retained turn receipts.
+pub struct Input<'a>(Vec<Part<'a>>);
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Part<'a> {
+    Text {
+        text: &'a str,
+    },
+    ResourceLink {
+        uri: &'a str,
+        name: &'a str,
+        mime_type: Option<&'a str>,
+    },
+}
+
+impl<'a> Input<'a> {
+    pub fn from_blocks(blocks: &'a [Block]) -> Option<Self> {
+        if blocks.is_empty() {
+            return None;
+        }
+        blocks
+            .iter()
+            .map(|block| match &block.content {
+                Content::Text(text) if !text.starts_with('/') => Some(Part::Text { text }),
+                Content::ResourceLink {
+                    uri,
+                    name,
+                    mime_type,
+                } if !uri.trim().is_empty() => Some(Part::ResourceLink {
+                    uri,
+                    name,
+                    mime_type: mime_type.as_deref(),
+                }),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .map(Self)
+    }
+
+    /// MSP has no resource-link part. Keep the reference in the native text
+    /// the provider and retained user item see, without dereferencing it.
+    pub fn text(&self) -> String {
+        self.0
+            .iter()
+            .map(|part| match part {
+                Part::Text { text } => (*text).to_owned(),
+                Part::ResourceLink { uri, name, .. } => {
+                    let label = if name.is_empty() { uri } else { name };
+                    format!("[resource: {label} ({uri})]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fingerprint(&self) -> io::Result<String> {
+        let previous: Option<Vec<_>> = self
+            .0
+            .iter()
+            .map(|part| match part {
+                Part::Text { text } => Some(*text),
+                Part::ResourceLink { .. } => None,
+            })
+            .collect();
+        // Existing plain-text receipts were hashes of an array of strings.
+        // A mixed prompt uses objects, so it cannot alias a string receipt.
+        let bytes = match previous {
+            Some(texts) => serde_json::to_vec(&texts)?,
+            None => serde_json::to_vec(&self.0)?,
+        };
+        Ok(crate::sha256::hex(&bytes))
+    }
+}
 
 pub struct Key {
     path: PathBuf,
@@ -30,11 +106,11 @@ pub struct Pending {
 }
 
 impl Key {
-    pub fn new(session: &str, key: &str, texts: &[&str]) -> io::Result<Self> {
+    pub fn new(session: &str, key: &str, input: &Input<'_>) -> io::Result<Self> {
         let dir = session_dir(session)?;
         Ok(Self {
             path: dir.join(crate::sha256::hex(key.as_bytes())),
-            fingerprint: crate::sha256::hex(&serde_json::to_vec(texts)?),
+            fingerprint: input.fingerprint()?,
         })
     }
 
@@ -130,5 +206,54 @@ pub fn available() -> bool {
 pub fn forget_session(session: &str) {
     if let Ok(dir) = session_dir(session) {
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_receipts_keep_the_existing_hash_and_link_hashes_include_the_uri() {
+        let old = Input(vec![
+            Part::Text { text: "hello" },
+            Part::Text { text: "world" },
+        ]);
+        assert_eq!(
+            old.fingerprint().unwrap(),
+            crate::sha256::hex(br#"["hello","world"]"#)
+        );
+        let linked = |uri| {
+            Input(vec![
+                Part::Text { text: "hello" },
+                Part::ResourceLink {
+                    uri,
+                    name: "example",
+                    mime_type: None,
+                },
+            ])
+        };
+        let input = linked("https://example.invalid/first");
+        assert_eq!(
+            input.text(),
+            "hello\n[resource: example (https://example.invalid/first)]"
+        );
+        assert_ne!(
+            input.fingerprint().unwrap(),
+            linked("https://example.invalid/second")
+                .fingerprint()
+                .unwrap()
+        );
+        assert_ne!(
+            input.fingerprint().unwrap(),
+            Input(vec![
+                Part::Text { text: "hello" },
+                Part::Text {
+                    text: "[resource: example (https://example.invalid/first)]"
+                },
+            ])
+            .fingerprint()
+            .unwrap()
+        );
     }
 }

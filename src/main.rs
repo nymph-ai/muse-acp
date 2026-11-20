@@ -6977,22 +6977,12 @@ fn handle_acp(
                 }
             };
             let keyed = if let Some(key) = &prompt.idempotency_key {
-                let texts: Option<Vec<&str>> = prompt
-                    .blocks
-                    .iter()
-                    .map(|block| match &block.content {
-                        request::Content::Text(text) if !text.starts_with('/') => {
-                            Some(text.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let Some(texts) = texts else {
+                let Some(input) = prompt_keys::Input::from_blocks(&prompt.blocks) else {
                     acp::send_error(
                         stdout,
                         &id,
                         -32602,
-                        "Keyed prompts currently require ordinary text",
+                        "Keyed prompts require ordinary text or resource links",
                     );
                     return;
                 };
@@ -7005,7 +6995,7 @@ fn handle_acp(
                     );
                     return;
                 }
-                let key = match prompt_keys::Key::new(&msp_sid, key, &texts) {
+                let key = match prompt_keys::Key::new(&msp_sid, key, &input) {
                     Ok(key) => key,
                     Err(error) => {
                         acp::send_error(stdout, &id, -32603, &error.to_string());
@@ -7015,26 +7005,40 @@ fn handle_acp(
                 if reply_to_keyed_retry(host, stdout, sessions, &sid, &msp_sid, &id, &key) {
                     return;
                 }
-                Some(key)
+                Some((key, input.text()))
             } else {
                 None
             };
-            let mut media_upload =
-                |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
-            let (parts, acp_content) = match extract_prompt_parts(
-                &prompt.blocks,
-                &roots,
-                skills.as_ref(),
-                &mut media_upload,
-            ) {
-                Ok((p, c)) if !p.is_empty() => (p, c),
-                Ok(_) => {
-                    acp::send_error(stdout, &id, -32602, "session/prompt requires content");
-                    return;
-                }
-                Err(e) => {
-                    acp::send_error(stdout, &id, -32602, &e);
-                    return;
+            let (parts, acp_content) = if let Some((_, text)) = &keyed {
+                let part = format!("{{\"type\":\"text\",\"text\":{}}}", esc(text));
+                let echo = out::Echo::from_blocks(
+                    ver,
+                    prompt
+                        .blocks
+                        .iter()
+                        .map(|block| block.echo.clone())
+                        .collect(),
+                );
+                (vec![part], echo)
+            } else {
+                let mut media_upload = |base64: &str, media_type: &str| {
+                    upload_video(host, &msp_sid, base64, media_type)
+                };
+                match extract_prompt_parts(
+                    &prompt.blocks,
+                    &roots,
+                    skills.as_ref(),
+                    &mut media_upload,
+                ) {
+                    Ok((p, c)) if !p.is_empty() => (p, c),
+                    Ok(_) => {
+                        acp::send_error(stdout, &id, -32602, "session/prompt requires content");
+                        return;
+                    }
+                    Err(e) => {
+                        acp::send_error(stdout, &id, -32602, &e);
+                        return;
+                    }
                 }
             };
             {
@@ -7406,7 +7410,11 @@ fn handle_acp(
                     "{{\"type\":\"text\",\"text\":{}}}",
                     esc(PLAN_INSTRUCTION)
                 ));
-                (parts, prompt_display_text(&acp_content))
+                let display = keyed.as_ref().map_or_else(
+                    || prompt_display_text(&acp_content),
+                    |(_, text)| text.clone(),
+                );
+                (parts, display)
             } else {
                 (parts, String::new())
             };
@@ -7443,7 +7451,7 @@ fn handle_acp(
                 String::new()
             };
             let pending = match keyed {
-                Some(key) => match key.reserve(cmd.clone()) {
+                Some((key, _)) => match key.reserve(cmd.clone()) {
                     Ok(receipt) => Some(prompt_keys::Pending {
                         key,
                         receipt,

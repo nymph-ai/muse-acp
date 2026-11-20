@@ -544,6 +544,88 @@ fn v2_keyed_prompt_reuses_its_real_msp_receipt_after_adapter_restart() {
 }
 
 #[test]
+fn v2_keyed_resource_link_retains_the_uri_and_recovers_its_real_msp_receipt() {
+    if !enabled("v2_keyed_resource_link_retains_the_uri_and_recovers_its_real_msp_receipt") {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
+    let mut writer = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let session = writer.new_session(&host, json!([]));
+    let uri = "https://example.invalid/reference?key=one#part";
+    let params = json!({
+        "sessionId": session, "idempotencyKey": "resource-loopback",
+        "prompt": [{"type":"text","text":"confirm reference [[script:hello]]"},
+                   {"type":"resource_link","name":"reference","uri":uri}]
+    });
+    let first = writer.request("session/prompt", params.clone());
+    let receipt = writer.result(first);
+    writer.wait("the keyed resource turn terminal", |frame| {
+        frame["params"]["update"]["state"] == "idle"
+            && frame["params"]["update"]["stopReason"] == "end_turn"
+    });
+    let live = writer.updates("user_message");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0]["messageId"], receipt["messageId"]);
+    assert_eq!(live[0]["content"][1]["uri"], uri);
+    assert_eq!(live[0]["content"][1]["type"], "resource_link");
+    writer.finish();
+
+    let provider_log = host.dir.join("provider.log");
+    let calls = std::fs::read_to_string(&provider_log).unwrap();
+    let reference = format!("confirm reference [[script:hello]]\n[resource: reference ({uri})]");
+    let main_inputs: Vec<_> = calls
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|call| call["last"]["text"] == reference)
+        .collect();
+    assert_eq!(main_inputs.len(), 1, "{calls}");
+
+    let keys = host.dir.join("home/.local/state/muse-acp/prompt-keys");
+    let scope = std::fs::read_dir(keys)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let record = std::fs::read_dir(scope)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut journal: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert_eq!(journal["command_id"], receipt["messageId"]);
+    assert_eq!(journal["inserted"], true);
+    journal["inserted"] = json!(false);
+    std::fs::write(&record, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    let mut reader = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let resume = reader.request(
+        "session/resume",
+        json!({
+            "sessionId": session, "cwd": host.workspace(), "replayFrom": {"type": "start"}
+        }),
+    );
+    reader.result(resume);
+    let replayed = reader.updates("user_message");
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0]["messageId"], receipt["messageId"]);
+    assert_eq!(replayed[0]["content"][0]["text"], reference);
+    let retry = reader.request("session/prompt", params.clone());
+    assert_eq!(reader.result(retry), receipt);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(record).unwrap()).unwrap()["inserted"],
+        true
+    );
+    let mut changed = params;
+    changed["prompt"][1]["uri"] = json!("https://example.invalid/reference?key=two#part");
+    let conflict = reader.request("session/prompt", changed);
+    assert_eq!(reader.response(conflict)["error"]["code"], -32602);
+    reader.finish();
+    assert_eq!(std::fs::read_to_string(provider_log).unwrap(), calls);
+}
+
+#[test]
 fn v2_replays_from_an_issued_boundary_after_native_msp_replacement() {
     if !enabled("v2_replays_from_an_issued_boundary_after_native_msp_replacement") {
         return;
