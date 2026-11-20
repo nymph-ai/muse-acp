@@ -11,8 +11,7 @@ muse-acp from this fork's releases, not upstream's.
   commits on top of it. Every fork release is tagged on it.
 - `master` follows upstream and carries no fork commits.
 
-The fork's commits, oldest first (on v0.21.0; the refused-turn drive handover, BrokkAi/muse-acp#452, was
-released upstream in v0.21.0 and dropped):
+The fork's changes on top of upstream v0.25.0:
 
 | Change | Upstream pull |
 | --- | --- |
@@ -21,6 +20,7 @@ released upstream in v0.21.0 and dropped):
 | A message keeps one id live and on every replay: a user message the id of the turn command that inserted it, any other message its host item id (nymph-ai/nymphai#7283) | none yet |
 | No model selector while the host lists no model: a select with no option is not valid ACP v2 (nymph-ai/nymphai#7283) | none yet |
 | A `session/leave` rejected `runtime_busy`, retryable (Muse 1.4.18), is asked again, up to five times (nymph-ai/nymphai#7432) | none yet |
+| The adapter uses ACP Rust SDK 5.4.0. Plain-text ACP v2 keyed prompts use retained native command receipts. Keyed slash commands and unissued fork cursors return Invalid params before reaching the Muse host. | none yet |
 | Releases are published from `fabric` under fork tags, with no npm package (this file, `FORK_RELEASE`, `scripts/release.py`, the workflows) | fork only |
 
 An upstream pull is a courtesy. Nothing here waits for one to merge; when
@@ -29,7 +29,7 @@ upstream releases a change the fork carries, the rebase drops the fork's copy.
 ## Releases
 
 A fork release is tagged `v<upstream version>-<FORK_RELEASE>`, for example
-`v0.21.0-nymph.1`: the Cargo version stays upstream's, and the file
+`v0.25.0-nymph.1`: the Cargo version stays upstream's, and the file
 `FORK_RELEASE` holds the suffix. The release workflow is upstream's, aimed at
 this repository: pushing `fabric` runs the `ci` and `release` preflights, and
 pushing the tag at that commit publishes the six archives

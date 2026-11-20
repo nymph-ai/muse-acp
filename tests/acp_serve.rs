@@ -12365,6 +12365,132 @@ fn unknown_kinds_render_fallback_text_only() {
 }
 
 #[test]
+fn v2_keyed_prompt_reuses_the_native_insertion_across_adapter_restart() {
+    let state = fresh_state_dir();
+    let state_path = state.to_str().expect("UTF-8 state path");
+    let mut original = Client::spawn("keyed_prompt", &[("XDG_STATE_HOME", state_path)]);
+    let sid = original.new_session(2, "");
+    let params = serde_json::json!({
+        "sessionId": sid, "idempotencyKey": "opaque-key",
+        "prompt": [{"type": "text", "text": "a real native prompt"}]
+    });
+    let first = original.req("session/prompt", &params.to_string());
+    let second = original.req("session/prompt", &params.to_string());
+    let reply = |client: &Client, rid| {
+        let frame = client.wait_for(&format!("\"id\":{rid},"), Duration::from_secs(15));
+        serde_json::from_str::<serde_json::Value>(&frame).expect("valid reply")
+    };
+    let added = reply(&original, first);
+    let message = added["result"]["messageId"]
+        .as_str()
+        .expect("native message ID");
+    assert_eq!(reply(&original, second)["result"]["messageId"], message);
+    let native_log = std::fs::read_to_string(&original.fake_log).expect("native log");
+    assert_eq!(
+        native_log
+            .lines()
+            .filter(|line| *line == "turn/start")
+            .count(),
+        1
+    );
+    let native_inputs = std::fs::read_to_string(format!("{}.input", original.fake_log)).unwrap();
+    let sent = native_inputs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|input| input["input"][0]["text"] == "a real native prompt")
+        .expect("native prompt");
+    assert_eq!(sent["commandId"], message);
+    original.finish();
+
+    let mut reconnect = Client::spawn("keyed_prompt", &[("XDG_STATE_HOME", state_path)]);
+    reconnect.initialize(2, "");
+    let resume = reconnect.req(
+        "session/resume",
+        &serde_json::json!({"sessionId": sid}).to_string(),
+    );
+    assert!(reply(&reconnect, resume).get("result").is_some());
+    let replay = reconnect.req("session/prompt", &params.to_string());
+    assert_eq!(reply(&reconnect, replay)["result"]["messageId"], message);
+    let mut different = params;
+    different["prompt"][0]["text"] = serde_json::json!("different body");
+    let mismatch = reconnect.req("session/prompt", &different.to_string());
+    assert_eq!(reply(&reconnect, mismatch)["error"]["code"], -32602);
+    let native_log = std::fs::read_to_string(&reconnect.fake_log).expect("native log");
+    assert!(
+        !native_log.lines().any(|line| line == "turn/start"),
+        "{native_log}"
+    );
+    reconnect.finish();
+    let _ = std::fs::remove_dir_all(state);
+}
+
+#[test]
+fn v2_keyed_pending_retries_share_the_native_queued_cancellation() {
+    let mut c = Client::spawn("keyed_queue", &[]);
+    let sid = c.new_session(2, "");
+    let params = serde_json::json!({
+        "sessionId": sid, "idempotencyKey": "held",
+        "prompt": [{"type": "text", "text": "a queued native prompt"}]
+    });
+    let first = c.req("session/prompt", &params.to_string());
+    let retry = c.req("session/prompt", &params.to_string());
+    c.wait_log("turn/start", Duration::from_secs(15));
+    c.raw(&format!(
+        r#"{{"jsonrpc":"2.0","method":"$/cancel_request","params":{{"requestId":{retry}}}}}"#
+    ));
+    for id in [first, retry] {
+        let frame = c.wait_for(&format!("\"id\":{id},"), Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("valid reply");
+        assert_eq!(reply["error"]["code"], -32800, "{frame}");
+    }
+    let log = std::fs::read_to_string(&c.fake_log).expect("native log");
+    assert_eq!(log.lines().filter(|line| *line == "turn/start").count(), 1);
+    assert_eq!(
+        log.lines().filter(|line| *line == "turn/unqueue").count(),
+        1
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_refuses_keyed_slash_commands_and_unissued_fork_cursors_before_host_effects() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    for (method, params) in [
+        (
+            "session/prompt",
+            serde_json::json!({"sessionId": sid, "idempotencyKey": "retry-key",
+                "prompt": [{"type": "text", "text": "/compact"}]}),
+        ),
+        (
+            "session/fork",
+            serde_json::json!({"sessionId": sid, "cwd": cwd, "cursorId": "unissued"}),
+        ),
+    ] {
+        let request = c.req(method, &params.to_string());
+        let frame = c.wait_for(&format!("\"id\":{request}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602"),
+            "{method} was not refused: {frame}"
+        );
+    }
+    let log = std::fs::read_to_string(&c.fake_log).expect("fake-host log");
+    assert!(
+        !log.contains("turn/start"),
+        "keyed prompt reached Muse: {log}"
+    );
+    assert!(
+        !log.contains("session/fork"),
+        "unknown cursor reached Muse: {log}"
+    );
+    c.finish();
+}
+
+#[test]
 fn session_fork_advertises_and_copies_without_a_cut_point() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");

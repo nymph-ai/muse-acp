@@ -18,6 +18,7 @@ mod mcp;
 mod modes;
 mod msp;
 mod out;
+mod prompt_keys;
 mod request;
 mod reviewer;
 mod sha256;
@@ -3723,6 +3724,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
         }
     };
     for mut f in settled {
+        end_keyed_prompt(stdout, f.keyed_prompt.take(), false);
         log(&format!(
             "reattach reconciliation: turn {} absent from the folded state; prompt settled as cancelled",
             f.msp_turn
@@ -4979,6 +4981,148 @@ fn accept_v2_prompt_as(
         agent_client_protocol::v2::schema::PromptResponse::new(msg_id.to_string()),
     );
     send_user_message(stdout, sid, msg_id, content);
+}
+
+/// An MSP user item is insertion evidence; an admission acknowledgment is not.
+fn inserted_prompt(item: &J, command: &str) -> bool {
+    item.get("kind").and_then(J::as_str) == Some("userMessage")
+        && item.get("commandId").and_then(J::as_str) == Some(command)
+}
+
+fn retained_prompt(host: &Arc<Hosts>, msp_sid: &str, command: &str) -> bool {
+    let read = host.command(
+        "session/read",
+        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
+    );
+    read.ok()
+        .and_then(|read| collect_history(host, msp_sid, &read).ok())
+        .is_some_and(|(items, _)| items.iter().any(|item| inserted_prompt(item, command)))
+}
+
+fn reply_to_keyed_retry(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    sid: &str,
+    msp_sid: &str,
+    id: &Option<RequestId>,
+    key: &prompt_keys::Key,
+) -> bool {
+    let mut receipt = match key.read() {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => return false,
+        Err(error) => {
+            acp::send_error(
+                stdout,
+                id,
+                -32603,
+                &format!("Could not read the Muse prompt receipt: {error}"),
+            );
+            return true;
+        }
+    };
+    if !key.matches(&receipt) {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "A different prompt already uses this idempotency key",
+        );
+        return true;
+    }
+    if let Some(pending) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(sid)
+        .and_then(|session| {
+            session.in_flight.iter_mut().find_map(|turn| {
+                turn.keyed_prompt
+                    .as_mut()
+                    .filter(|pending| pending.receipt.command_id == receipt.command_id)
+            })
+        })
+    {
+        pending.waiters.extend(id.clone());
+        return true;
+    }
+    if receipt.inserted || retained_prompt(host, msp_sid, &receipt.command_id) {
+        if !receipt.inserted {
+            let _ = key.confirm(&mut receipt);
+        }
+        acp::send_response(
+            stdout,
+            id,
+            agent_client_protocol::v2::schema::PromptResponse::new(receipt.command_id),
+        );
+        return true;
+    }
+    // The command's result was lost. A retry is safe only after proving
+    // insertion or refusal, since adapter state may have changed the MSP payload.
+    acp::send_error(
+        stdout,
+        id,
+        -32000,
+        "Muse has no confirmed insertion receipt for this prompt",
+    );
+    true
+}
+
+fn confirm_keyed_prompt(stdout: &StdoutShared, sid: &str, mut pending: prompt_keys::Pending) {
+    if let Err(error) = pending.key.confirm(&mut pending.receipt) {
+        log(&format!(
+            "Could not retain the Muse prompt receipt: {error}"
+        ));
+    }
+    let command = pending.receipt.command_id;
+    for id in pending.waiters {
+        acp::send_response(
+            stdout,
+            &Some(id),
+            agent_client_protocol::v2::schema::PromptResponse::new(command.clone()),
+        );
+    }
+    send_user_message(stdout, sid, &command, &pending.content);
+    acp::send_state(stdout, sid, "running", None);
+}
+
+fn observe_keyed_prompt(stdout: &StdoutShared, sessions: &Sessions, sid: &str, item: &J) {
+    let pending = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(sid)
+        .and_then(|session| {
+            session.in_flight.iter_mut().find(|turn| {
+                turn.keyed_prompt
+                    .as_ref()
+                    .is_some_and(|pending| inserted_prompt(item, &pending.receipt.command_id))
+            })
+        })
+        .and_then(|turn| {
+            turn.queued = false;
+            turn.keyed_prompt.take()
+        });
+    if let Some(pending) = pending {
+        confirm_keyed_prompt(stdout, sid, pending);
+    }
+}
+
+fn end_keyed_prompt(stdout: &StdoutShared, pending: Option<prompt_keys::Pending>, cancelled: bool) {
+    let Some(pending) = pending else { return };
+    if cancelled {
+        let _ = pending.key.forget();
+    }
+    for id in pending.waiters {
+        if cancelled {
+            cancel_v2_prompt_before_insertion(stdout, &Some(id));
+        } else {
+            acp::send_error(
+                stdout,
+                &Some(id),
+                -32000,
+                "Muse did not confirm whether the keyed prompt was inserted",
+            );
+        }
+    }
 }
 
 /// Answer an ACP v2 prompt that was cancelled before its message was
@@ -6337,6 +6481,15 @@ fn handle_acp(
             }
         }
         Request::ForkSession(setup) => {
+            if setup.fork_cursor.is_some() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "Muse has not issued a fork cursor for this session",
+                );
+                return;
+            }
             let ver = negotiated_ver();
             let src_sid = setup.session_id.clone();
             if src_sid.is_empty() {
@@ -6768,6 +6921,49 @@ fn handle_acp(
                     return;
                 }
             };
+            let keyed = if let Some(key) = &prompt.idempotency_key {
+                let texts: Option<Vec<&str>> = prompt
+                    .blocks
+                    .iter()
+                    .map(|block| match &block.content {
+                        request::Content::Text(text) if !text.starts_with('/') => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let Some(texts) = texts else {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        "Keyed prompts currently require ordinary text",
+                    );
+                    return;
+                };
+                if !host.handshake().restartable() {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        "Keyed prompts require a durable Muse host",
+                    );
+                    return;
+                }
+                let key = match prompt_keys::Key::new(&msp_sid, key, &texts) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        acp::send_error(stdout, &id, -32603, &error.to_string());
+                        return;
+                    }
+                };
+                if reply_to_keyed_retry(host, stdout, sessions, &sid, &msp_sid, &id, &key) {
+                    return;
+                }
+                Some(key)
+            } else {
+                None
+            };
             let mut media_upload =
                 |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
             let (parts, acp_content) = match extract_prompt_parts(
@@ -6962,6 +7158,7 @@ fn handle_acp(
                                 req_id: id.clone(),
                                 queued: false,
                                 file_report: report_request.map(new_file_report),
+                                keyed_prompt: None,
                                 declined_retract_notified: false,
                             });
                             s.active_turn = Some(turn.to_string());
@@ -7190,6 +7387,39 @@ fn handle_acp(
             } else {
                 String::new()
             };
+            let pending = match keyed {
+                Some(key) => match key.reserve(cmd.clone()) {
+                    Ok(receipt) => Some(prompt_keys::Pending {
+                        key,
+                        receipt,
+                        content: acp_content.clone(),
+                        waiters: id.clone().into_iter().collect(),
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if !reply_to_keyed_retry(host, stdout, sessions, &sid, &msp_sid, &id, &key)
+                        {
+                            acp::send_error(
+                                stdout,
+                                &id,
+                                -32000,
+                                "The prior Muse prompt lacks an insertion receipt",
+                            );
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("Could not reserve the prompt key: {error}"),
+                        );
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let is_keyed = pending.is_some();
             match turn_command(
                 host,
                 &msp_sid,
@@ -7228,6 +7458,7 @@ fn handle_acp(
                             msp_turn: turn.clone(),
                             req_id: id.clone(),
                             queued: !started,
+                            keyed_prompt: pending,
                             file_report: report_request.map(new_file_report),
                             declined_retract_notified: false,
                         });
@@ -7235,13 +7466,13 @@ fn handle_acp(
                             s.active_turn = Some(turn);
                         }
                     }
-                    if ver == 2 {
+                    if ver == 2 && !is_keyed {
                         // Accepted: the inserted message's id, then the
                         // user-message echo under that id (v2 MUST), then
                         // running.
                         accept_v2_prompt_as(stdout, &id, &sid, &cmd, &acp_content);
                         acp::send_state(stdout, &sid, "running", None);
-                    } else {
+                    } else if ver != 2 {
                         // v1 prompt flow echoes user content as chunks.
                         send_user_message(stdout, &sid, &cmd, &acp_content);
                     }
@@ -7249,6 +7480,21 @@ fn handle_acp(
                 }
                 Err(e) => {
                     let code = err_code(&e);
+                    if let Some(pending) = pending {
+                        let rejected =
+                            matches!(code, -32601 | -32602 | -32010 | -32020 | -32021 | -32030);
+                        if rejected {
+                            let _ = pending.key.forget();
+                        } else {
+                            acp::send_error(
+                                stdout,
+                                &id,
+                                -32000,
+                                "Muse did not confirm whether the keyed prompt was inserted",
+                            );
+                            return;
+                        }
+                    }
                     if code == -32000 || err_message(&e).contains("already_terminal") {
                         send_host_error(
                             stdout,
@@ -7893,6 +8139,7 @@ fn handle_acp(
                     req_id: None,
                     queued: false,
                     file_report: None,
+                    keyed_prompt: None,
                     declined_retract_notified: false,
                 });
             }
@@ -8201,7 +8448,12 @@ fn handle_acp(
                 .find_map(|s| {
                     s.in_flight
                         .iter()
-                        .find(|f| f.req_id.as_ref() == Some(&request_id))
+                        .find(|f| {
+                            f.req_id.as_ref() == Some(&request_id)
+                                || f.keyed_prompt
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.waiters.contains(&request_id))
+                        })
                         .map(|f| (s.msp_sid.clone(), f.msp_turn.clone(), f.queued))
                 });
             let Some((msp_sid, turn_id, queued)) = target else {
@@ -11395,6 +11647,7 @@ fn forget_deleted_session(
         cache.deleted.insert(msp_sid.to_string());
     }
     modes::forget(msp_sid);
+    prompt_keys::forget_session(msp_sid);
     host.forget_owner(msp_sid);
 }
 
@@ -11989,6 +12242,7 @@ fn handle_msp(
                 .unwrap_or("");
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                observe_keyed_prompt(stdout, sessions, &acp_sid, &item);
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()
@@ -12025,6 +12279,7 @@ fn handle_msp(
                 .unwrap_or("");
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) {
+                observe_keyed_prompt(stdout, sessions, &acp_sid, &item);
                 observe_file_change(sessions, &acp_sid, &item);
                 // Read outside the session lock: it asks the host. An editor
                 // tool's diff or terminal was recorded by the bridge.
@@ -12142,8 +12397,9 @@ fn handle_msp(
                     acp::send_fold_lines(stdout, s, checks);
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
-                    let finished = pos.map(|p| s.in_flight.remove(p));
+                    let mut finished = pos.map(|p| s.in_flight.remove(p));
                     let req_id = finished.as_ref().map(|f| f.req_id.clone());
+                    let keyed = finished.as_mut().and_then(|f| f.keyed_prompt.take());
                     let file_report = finished.and_then(|f| f.file_report);
                     let rest = s.in_flight.len();
                     // The turn's model-call legs, summed. Every completion's
@@ -12151,10 +12407,17 @@ fn handle_msp(
                     // that precedes this terminal record, so they have all
                     // arrived by now; a turn that reported none carries none.
                     let usage = acp::take_turn_usage(s, turn_id).and_then(|u| u.result_usage());
-                    (req_id, ver, rest, usage, file_report)
+                    (req_id, ver, rest, usage, file_report, keyed)
                 });
-            if let Some((req_id, ver, rest, usage, file_report)) = settled {
+            if let Some((req_id, ver, rest, usage, file_report, keyed)) = settled {
                 let deferred_start_failure = error_kind == "launchError";
+                if let Some(pending) = keyed {
+                    if retained_prompt(host, msp_sid, &pending.receipt.command_id) {
+                        confirm_keyed_prompt(stdout, &acp_sid, pending);
+                    } else {
+                        end_keyed_prompt(stdout, Some(pending), deferred_start_failure);
+                    }
+                }
                 let stop = if deferred_start_failure {
                     // A launchError is the terminal for a queued admission
                     // that never reached turn/started. It is an actionable
@@ -12231,6 +12494,7 @@ fn handle_msp(
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
                     let finished = s.in_flight.remove(pos);
+                    end_keyed_prompt(stdout, finished.keyed_prompt, true);
                     Some((
                         finished.req_id,
                         ver,
@@ -12526,6 +12790,7 @@ fn handle_msp(
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
                     let finished = s.in_flight.remove(pos);
+                    end_keyed_prompt(stdout, finished.keyed_prompt, false);
                     Some((
                         finished.req_id,
                         ver,
@@ -14908,6 +15173,7 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
     match removed {
         Some(s) => {
             for f in s.in_flight {
+                end_keyed_prompt(stdout, f.keyed_prompt, false);
                 if s.ver == 2 {
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
@@ -14969,6 +15235,7 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
         return;
     }
     for f in &mut s.in_flight {
+        end_keyed_prompt(stdout, f.keyed_prompt.take(), false);
         if let Some(report) = f.file_report.take() {
             send_file_report(
                 stdout,

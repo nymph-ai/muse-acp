@@ -15,7 +15,7 @@ use crate::json::{J, esc, parse_json};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-fn store_path() -> Option<PathBuf> {
+pub(crate) fn state_directory() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -26,7 +26,11 @@ fn store_path() -> Option<PathBuf> {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
             }
         })?;
-    Some(state.join("muse-acp").join("session-modes.json"))
+    Some(state.join("muse-acp"))
+}
+
+fn store_path() -> Option<PathBuf> {
+    Some(state_directory()?.join("session-modes.json"))
 }
 
 fn read_all() -> Vec<(String, String)> {

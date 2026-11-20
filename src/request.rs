@@ -27,6 +27,7 @@ pub struct Setup {
     /// ACP v2 `replayFrom` on `session/resume`, and JetBrains AIR's
     /// extension of it to `session/fork`. `None` when absent or `null`.
     pub replay_from: Option<Replay>,
+    pub fork_cursor: Option<String>,
     /// The client's `systemPrompt`; `None` when absent or `null`.
     pub system_prompt: Option<SystemPrompt>,
     pub meta: Meta,
@@ -81,6 +82,7 @@ impl McpServer {
 pub struct Prompt {
     pub session_id: String,
     pub blocks: Vec<Block>,
+    pub idempotency_key: Option<String>,
     pub meta: Meta,
 }
 
@@ -281,6 +283,7 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    fork_cursor: None,
                     system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
@@ -295,6 +298,7 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    fork_cursor: None,
                     system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
@@ -308,12 +312,14 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    fork_cursor: r.cursor_id.map(|id| id.to_string()),
                     system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::PromptRequest(r) => Request::Prompt(Prompt {
                     session_id: r.session_id.to_string(),
                     blocks: r.prompt.iter().map(v1_block).collect(),
+                    idempotency_key: None,
                     meta: meta(r.meta),
                 }),
                 R::CloseSessionRequest(r) => Request::CloseSession {
@@ -363,6 +369,7 @@ fn v1_load(r: v1::schema::LoadSessionRequest) -> Setup {
         additional_directories: r.additional_directories.iter().map(|p| path(p)).collect(),
         mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
         replay_from: None,
+        fork_cursor: None,
         system_prompt: r.system_prompt.map(v1_system_prompt),
         meta: meta(r.meta),
     }
@@ -496,6 +503,7 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: None,
+                    fork_cursor: None,
                     system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
@@ -509,6 +517,7 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: r.replay_from.map(v2_replay),
+                    fork_cursor: None,
                     system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
@@ -522,12 +531,14 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: None,
+                    fork_cursor: r.cursor_id.map(|id| id.to_string()),
                     system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::PromptRequest(r) => Request::Prompt(Prompt {
                     session_id: r.session_id.to_string(),
                     blocks: r.prompt.iter().map(v2_block).collect(),
+                    idempotency_key: r.idempotency_key.map(|key| key.as_str().to_owned()),
                     meta: meta(r.meta),
                 }),
                 R::CloseSessionRequest(r) => Request::CloseSession {

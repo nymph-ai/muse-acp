@@ -1073,7 +1073,15 @@ def editor_bridge_turn_guarded(base):
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": ACTIVE_SESSION[0], "turnId": tid}
-    if SCENARIO in ("happy", "malformed_msp", "drive_taken"):
+    if SCENARIO == "keyed_queue":
+        pass
+    elif SCENARIO == "keyed_prompt":
+        command = params["commandId"]
+        item = {"itemId": "keyed-user", "kind": "userMessage", "commandId": command,
+                "turnId": tid, "status": "completed", "text": params["input"][0]["text"]}
+        notify("item/completed", {**base, "item": item})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("happy", "malformed_msp", "drive_taken"):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
@@ -2193,7 +2201,7 @@ def on_turn_start(params):
         notify("turn/completed", {**base, "terminal": "completed"})
     disposition = (
         "queued"
-        if SCENARIO == "deferred_launch_error"
+        if SCENARIO in ("deferred_launch_error", "keyed_queue")
         or (SCENARIO in ("queued", "cancel_request") and TURNS[0] > 1)
         else "started"
     )
@@ -2761,7 +2769,7 @@ def result_for(method, msg):
     if method == "turn/unqueue":
         params = msg.get("params", {})
         log_input(params)
-        if SCENARIO == "cancel_request":
+        if SCENARIO in ("cancel_request", "keyed_queue"):
             notify("turn/unqueued", {
                 "sessionId": MSP_SID,
                 "turnId": params.get("turnId", ""),

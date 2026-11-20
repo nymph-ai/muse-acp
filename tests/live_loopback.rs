@@ -205,6 +205,15 @@ impl Adapter {
     }
 
     fn launch_with_env(host: &Host, capabilities: Value, extra_env: &[(&str, &str)]) -> Adapter {
+        Self::launch_protocol(host, capabilities, extra_env, 1)
+    }
+
+    fn launch_protocol(
+        host: &Host,
+        capabilities: Value,
+        extra_env: &[(&str, &str)],
+        version: u8,
+    ) -> Adapter {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let home = host.dir.join("home");
         let log = host.dir.join(format!(
@@ -264,10 +273,12 @@ impl Adapter {
             next_id: 0,
             log,
         };
-        let id = adapter.request(
-            "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
-        );
+        let params = if version == 2 {
+            json!({"protocolVersion": 2, "info": {"name": "loopback", "version": "1"}, "capabilities": capabilities})
+        } else {
+            json!({"protocolVersion": 1, "clientCapabilities": capabilities})
+        };
+        let id = adapter.request("initialize", params);
         adapter.result(id);
         adapter
     }
@@ -476,6 +487,60 @@ fn a_prompt_streams_the_model_reply_and_ends_the_turn() {
         "{result}"
     );
     adapter.finish();
+}
+
+#[test]
+fn v2_keyed_prompt_reuses_its_real_msp_receipt_after_adapter_restart() {
+    if !enabled("v2_keyed_prompt_reuses_its_real_msp_receipt_after_adapter_restart") {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
+    let mut writer = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let session = writer.new_session(&host, json!([]));
+    let params = json!({
+        "sessionId": session, "idempotencyKey": "keyed-loopback",
+        "prompt": [{"type": "text", "text": "say hello [[script:hello]]"}]
+    });
+    let first = writer.request("session/prompt", params.clone());
+    let retry = writer.request("session/prompt", params.clone());
+    let added = writer.result(first);
+    assert!(added["messageId"].is_string());
+    assert_eq!(writer.result(retry), added);
+    writer.wait("the keyed turn terminal", |frame| {
+        frame["params"]["update"]["state"] == "idle"
+            && frame["params"]["update"]["stopReason"] == "end_turn"
+    });
+    assert_eq!(writer.updates("user_message").len(), 1);
+    writer.finish();
+    let provider_log = host.dir.join("provider.log");
+    let calls =
+        std::fs::read_to_string(&provider_log).expect("real host reached loopback provider");
+
+    let mut reader = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let resume = reader.request(
+        "session/resume",
+        json!({
+            "sessionId": session, "cwd": host.workspace(), "replayFrom": {"type": "start"}
+        }),
+    );
+    reader.result(resume);
+    assert!(
+        reader
+            .updates("user_message")
+            .iter()
+            .chain(reader.updates("user_message_chunk").iter())
+            .any(|message| message["messageId"] == added["messageId"])
+    );
+    let replay = reader.request("session/prompt", params);
+    assert_eq!(reader.result(replay), added);
+    assert!(
+        reader
+            .updates("state_update")
+            .iter()
+            .all(|state| state["state"] != "running")
+    );
+    reader.finish();
+    assert_eq!(std::fs::read_to_string(provider_log).unwrap(), calls);
 }
 
 #[test]
