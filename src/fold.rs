@@ -83,9 +83,7 @@ fn msp_status(s: &str) -> &'static str {
     match s {
         "completed" => "completed",
         "failed" => "failed",
-        // ACP (v1 and v2) has no `cancelled` tool status; emitting one makes the
-        // whole session/update unparseable on the client, which strands the
-        // tool card in_progress. Map it to the nearest legal terminal.
+        // The legacy tool and host cards use the nearest legal terminal.
         "cancelled" | "rejected" | "timedOut" => "failed",
         "in_progress" | "inProgress" | "running" | "started" => "in_progress",
         _ => "pending",
@@ -3018,7 +3016,10 @@ impl SessionFold {
         (title, tool.to_string())
     }
 
-    fn tool_status(item: &J, status: &str) -> &'static str {
+    fn tool_status(item: &J, status: &str, ver: u8) -> &'static str {
+        if ver == 2 && status == "cancelled" {
+            return "cancelled";
+        }
         if matches!(item.get("held"), Some(J::Bool(true)))
             && !matches!(
                 status,
@@ -3633,7 +3634,7 @@ impl SessionFold {
                             .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
-                        status: Self::tool_status(item, status),
+                        status: Self::tool_status(item, status, ver),
                         content_text: None,
                         raw_input: Some(&raw),
                         locations: locations.clone(),
@@ -4152,7 +4153,7 @@ impl SessionFold {
                             .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
-                        status: Self::tool_status(item, status),
+                        status: Self::tool_status(item, status, ver),
                         content_text: content,
                         raw_input: raw.as_deref(),
                         locations: locations.clone(),

@@ -373,6 +373,7 @@ fn status_v2(status: &str) -> s2::ToolCallStatus {
         "pending" => s2::ToolCallStatus::Pending,
         "completed" => s2::ToolCallStatus::Completed,
         "failed" => s2::ToolCallStatus::Failed,
+        "cancelled" => s2::ToolCallStatus::Cancelled,
         "in_progress" => s2::ToolCallStatus::InProgress,
         other => s2::ToolCallStatus::Other(other.to_string()),
     }

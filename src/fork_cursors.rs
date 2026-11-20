@@ -81,6 +81,63 @@ pub fn boundaries<'a>(acp_sid: &str, msp_sid: &str, items: &'a [J]) -> Vec<Bound
     result
 }
 
+/// A live cursor needs a complete, plain transcript and the same user
+/// message that the accepted ACP prompt put on this connection. Fork will
+/// recompute the same native before-user boundary from a subsequent read.
+pub fn settled_chat_boundary<'a>(
+    acp_sid: &str,
+    msp_sid: &str,
+    items: &'a [J],
+    turn_id: &str,
+    command: &str,
+    text: &str,
+) -> Option<Boundary<'a>> {
+    if !items.iter().all(settled_chat_item) {
+        return None;
+    }
+    let boundary = boundaries(acp_sid, msp_sid, items)
+        .into_iter()
+        .find(|boundary| boundary.anchor_message == command)?;
+    let (user, replies) = items[boundary.index..].split_first()?;
+    (user.non_empty_str("turnId") == Some(turn_id)
+        && user.non_empty_str("commandId") == Some(command)
+        && user.non_empty_str("text") == Some(text)
+        && user
+            .get("displayText")
+            .and_then(J::as_str)
+            .is_none_or(|display| display == text)
+        && replies
+            .iter()
+            .any(|item| item.non_empty_str("kind") == Some("agentMessage"))
+        && replies.iter().all(|item| {
+            item.non_empty_str("turnId") == Some(turn_id)
+                && item.non_empty_str("kind") != Some("userMessage")
+        }))
+    .then_some(boundary)
+}
+
+fn settled_chat_item(item: &J) -> bool {
+    // A normal chat can contain native reminder lifecycle rows. The same
+    // settled rows are accepted by the existing replay/fork validator.
+    let has_content = match item.non_empty_str("kind") {
+        Some("userMessage" | "agentMessage") => item.non_empty_str("text").is_some(),
+        Some("reminderChild") => item.non_empty_str("reminderAgentId").is_some(),
+        _ => false,
+    };
+    has_content
+        && item.non_empty_str("itemId").is_some()
+        && item.non_empty_str("turnId").is_some()
+        && item.non_empty_str("status") == Some("completed")
+        && item.get("attachments").is_none_or(|attachments| {
+            matches!(attachments, J::Null)
+                || matches!(attachments, J::Arr(items) if items.is_empty())
+        })
+        && item
+            .get("cutOff")
+            .is_none_or(|value| matches!(value, J::Null | J::Bool(false)))
+        && !matches!(item.get("truncated"), Some(J::Bool(true)))
+}
+
 fn session_dir(session: &str) -> Option<PathBuf> {
     Some(
         modes::state_directory()?

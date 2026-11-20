@@ -23,6 +23,8 @@ pub struct InFlight {
     pub queued: bool,
     pub file_report: Option<FileChangeReport>,
     pub keyed_prompt: Option<crate::prompt_keys::Pending>,
+    /// The ACP user ID and exact single-text input for a normal MSP turn.
+    pub cursor_prompt: Option<(String, String)>,
     /// A declined retract keeps this prompt open; report it only once.
     pub declined_retract_notified: bool,
 }

@@ -112,6 +112,21 @@ struct PendingDelete {
 static LEAVES: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Native release and the folded terminals of all known turns jointly
+/// discharge a v2 close. Admission alone does not end the attachment.
+struct PendingClose {
+    command_id: String,
+    msp_sid: String,
+    host_kind: HostKind,
+    waiters: Vec<RequestId>,
+    turns: std::collections::HashSet<String>,
+    released: bool,
+    deadline: std::time::Instant,
+}
+
+static CLOSES: LazyLock<Mutex<HashMap<String, PendingClose>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static DELETES: LazyLock<Mutex<HashMap<String, PendingDelete>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -2758,6 +2773,23 @@ fn log_legacy_workspace_roots(msp_sid: &str, cwd: &str) {
     }
 }
 
+fn validate_channel_reply_setup(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    servers: &[request::McpServer],
+    target: Option<&str>,
+) -> bool {
+    let target = target.filter(|_| negotiated_ver() == 2 && host.handshake().session_mcp);
+    match mcp::validate_reply_scope(servers, target) {
+        Ok(()) => true,
+        Err(message) => {
+            acp::send_error(stdout, id, -32602, message);
+            false
+        }
+    }
+}
+
 /// The client's MCP servers as MSP `config.mcpServers` JSON, or None when
 /// there is nothing to send. Dropped entries are logged. A host without the
 /// `sessionMcp` grant (Muse before 1.3.0) would reject a non-empty map, so
@@ -2919,13 +2951,11 @@ fn setup_developer_prompt(
 }
 
 /// MSP `session/resume` with inline history, the client's MCP servers, and
-/// its system prompt as the developer prompt. A session this host has
-/// already loaded keeps the MCP set it was loaded with (MSP has no unload),
-/// so a different set is rejected as `session_configuration_conflict`. Retry
-/// once without the MCP servers: the session attaches with the servers it
-/// has instead of becoming unusable. The developer prompt is kept on the
-/// retry, since a loaded session takes a new one. Without a developer prompt
-/// Muse keeps the one it stored with the session.
+/// its system prompt as the developer prompt. A loaded session can reject a
+/// different MCP set as `session_configuration_conflict`. Legacy clients may
+/// reattach without applying the new set, keeping their developer prompt. A
+/// reply-enabled ACP v2 runtime must apply the requested configuration
+/// explicitly, so a rejected replacement cannot leave an old delegation live.
 /// If the host refuses because a client holds the drive, ask for it once and resume again.
 fn resume_session(
     host: &Arc<Hosts>,
@@ -2966,7 +2996,11 @@ fn resume_session(
         result => result,
     };
     match send(mcp_servers) {
-        Err(e) if mcp_servers.is_some() && msp::is_session_configuration_conflict(&e) => {
+        Err(e)
+            if mcp_servers.is_some()
+                && msp::is_session_configuration_conflict(&e)
+                && !(negotiated_ver() == 2 && mcp::reply_scope_configured()) =>
+        {
             log(&format!(
                 "session {msp_sid} is already loaded with a different MCP server set; it keeps that set until muse-acp restarts"
             ));
@@ -4484,15 +4518,21 @@ fn main() {
     let mut read_only_budget = RestartBudget::new();
 
     loop {
-        // A pending review deadline must wake the loop even when no host or
-        // editor message arrives; otherwise a hung reviewer turn would stall
-        // the approval indefinitely.
+        expire_native_closes(&stdout);
+        // Review and close deadlines wake this loop even when neither
+        // transport sends another frame.
         let msg = {
-            let deadline = REVIEW_STATE
+            let review = REVIEW_STATE
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .deadline;
-            match deadline {
+            let close = CLOSES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .map(|close| close.deadline)
+                .min();
+            match review.into_iter().chain(close).min() {
                 Some(deadline) => match rx
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                 {
@@ -4674,6 +4714,11 @@ fn main() {
                     log(&format!("replaced {} host exited ({why})", tag.kind.name()));
                     continue;
                 }
+                fail_native_closes(
+                    &stdout,
+                    |close| close.host_kind == tag.kind,
+                    "Muse exited before it confirmed session close",
+                );
                 if tag.kind == HostKind::Reviewer {
                     fail_pending_deletes_for(
                         &stdout,
@@ -5005,14 +5050,22 @@ fn inserted_prompt(item: &J, command: &str) -> bool {
         && item.get("commandId").and_then(J::as_str) == Some(command)
 }
 
-fn retained_prompt(host: &Arc<Hosts>, msp_sid: &str, command: &str) -> bool {
-    let read = host.command(
-        "session/read",
-        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
-    );
-    read.ok()
-        .and_then(|read| collect_history(host, msp_sid, &read).ok())
-        .is_some_and(|(items, _)| items.iter().any(|item| inserted_prompt(item, command)))
+fn retained_prompt(host: &Arc<Hosts>, msp_sid: &str, command: &str) -> Option<J> {
+    let read = host
+        .command(
+            "session/read",
+            &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
+        )
+        .ok()?;
+    if read.get("session")?.non_empty_str("sessionId") != Some(msp_sid) {
+        return None;
+    }
+    let (items, _) = collect_history(host, msp_sid, &read).ok()?;
+    let mut matches = items
+        .into_iter()
+        .filter(|item| inserted_prompt(item, command));
+    let item = matches.next()?;
+    matches.next().is_none().then_some(item)
 }
 
 fn reply_to_keyed_retry(
@@ -5061,9 +5114,13 @@ fn reply_to_keyed_retry(
         pending.waiters.extend(id.clone());
         return true;
     }
-    if receipt.inserted || retained_prompt(host, msp_sid, &receipt.command_id) {
-        if !receipt.inserted {
-            let _ = key.confirm(&mut receipt);
+    let retained = (!receipt.inserted)
+        .then(|| retained_prompt(host, msp_sid, &receipt.command_id))
+        .flatten()
+        .filter(|item| receipt.accepts_recovery(item));
+    if receipt.inserted || retained.is_some() {
+        if let Some(item) = retained {
+            let _ = key.confirm(&mut receipt, &item);
         }
         acp::send_response(
             stdout,
@@ -5083,8 +5140,13 @@ fn reply_to_keyed_retry(
     true
 }
 
-fn confirm_keyed_prompt(stdout: &StdoutShared, sid: &str, mut pending: prompt_keys::Pending) {
-    if let Err(error) = pending.key.confirm(&mut pending.receipt) {
+fn confirm_keyed_prompt(
+    stdout: &StdoutShared,
+    sid: &str,
+    mut pending: prompt_keys::Pending,
+    item: &J,
+) {
+    if let Err(error) = pending.key.confirm(&mut pending.receipt, item) {
         log(&format!(
             "Could not retain the Muse prompt receipt: {error}"
         ));
@@ -5118,7 +5180,7 @@ fn observe_keyed_prompt(stdout: &StdoutShared, sessions: &Sessions, sid: &str, i
             turn.keyed_prompt.take()
         });
     if let Some(pending) = pending {
-        confirm_keyed_prompt(stdout, sid, pending);
+        confirm_keyed_prompt(stdout, sid, pending, item);
     }
 }
 
@@ -5537,6 +5599,9 @@ fn handle_acp(
         ),
         Request::NewSession(setup) => {
             let ver = negotiated_ver();
+            if !validate_channel_reply_setup(host, stdout, &id, &setup.mcp_servers, None) {
+                return;
+            }
             if !validate_session_roots(stdout, &id, &setup) {
                 return;
             }
@@ -5876,6 +5941,10 @@ fn handle_acp(
             };
             let resume_cwd = setup.cwd.clone();
             let sid = setup.session_id.clone();
+            if close_pending(&sid) {
+                acp::send_error(stdout, &id, -32603, "Muse session close is still pending");
+                return;
+            }
             if sid.is_empty() {
                 acp::send_error(
                     stdout,
@@ -5954,6 +6023,15 @@ fn handle_acp(
                 .map(|s| s.msp_sid.clone())
                 .or(meta_msp_sid)
                 .unwrap_or_else(|| sid.clone());
+            if !validate_channel_reply_setup(
+                host,
+                stdout,
+                &id,
+                &setup.mcp_servers,
+                (msp_sid == sid).then_some(sid.as_str()),
+            ) {
+                return;
+            }
             let replay_cursor = match (&setup.replay_from, ver) {
                 (Some(request::Replay::Cursor(cursor)), 2) => {
                     if !fork_cursors::was_issued(&msp_sid, &sid, cursor) {
@@ -5972,16 +6050,41 @@ fn handle_acp(
             // Preserve the last delivered cursor before resume updates the
             // in-memory session. This is the anchor for an explicit suffix
             // replay on hosts that provide view/subscribe.
-            let previous_cursor = sessions
+            let active_cursor = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get(&sid)
-                .map(|s| s.view_cursor.clone())
-                .filter(|cursor| !cursor.is_empty());
+                .map(|s| s.view_cursor.clone());
+            let previously_active = active_cursor.is_some();
+            let previous_cursor = active_cursor.filter(|cursor| !cursor.is_empty());
             // The host does not persist session MCP configuration, so a load
             // must carry the client's servers again to restore the tools.
             let (mcp_servers, _) =
                 session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, true, Some(&sid));
+            let mcp_servers = mcp_servers.or_else(|| {
+                (ver == 2 && mcp::reply_scope_configured() && host.handshake().session_mcp)
+                    .then(|| "{}".to_string())
+            });
+            if ver == 2
+                && sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&sid)
+                    .is_some_and(|session| {
+                        mcp::changes_loaded_reply(
+                            session.mcp_servers.as_deref(),
+                            mcp_servers.as_deref(),
+                        )
+                    })
+            {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "close the active Muse session before changing its channel reply MCP scope",
+                );
+                return;
+            }
             // A session this adapter holds keeps its mode; one loaded fresh
             // takes the mode it was left in, and a read-only or plan session
             // opens on the read-only host.
@@ -5998,14 +6101,67 @@ fn handle_acp(
             let session_mode = mode_on_host(session_mode, host.owner(&msp_sid));
             // Ask for inline history explicitly; the host may still downgrade
             // (history.mode reports what was served).
-            match resume_session(
+            let reply_scope = if ver == 2 && !previously_active && host.handshake().session_mcp {
+                match mcp::lock_reply_scope() {
+                    Ok(Some(lock)) => {
+                        let read = host.command(
+                            "session/read",
+                            &format!("{{\"sessionId\":{},\"excludeItems\":true}}", esc(&msp_sid)),
+                        );
+                        match read {
+                            Ok(facts)
+                                if facts.get("session").is_some_and(|native| {
+                                    native.non_empty_str("sessionId") == Some(msp_sid.as_str())
+                                        && native.non_empty_str("status") == Some("notLoaded")
+                                }) =>
+                            {
+                                Some(lock)
+                            }
+                            Ok(_) => {
+                                acp::send_error(
+                                    stdout,
+                                    &id,
+                                    -32602,
+                                    "Muse must release the loaded session before attaching a new channel reply scope",
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                send_host_error(
+                                    stdout,
+                                    &id,
+                                    &error,
+                                    -32002,
+                                    "could not verify Muse session attachment",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            "could not lock Muse channel reply scope",
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let resumed = resume_session(
                 host,
                 &msp_sid,
                 mcp_servers.as_deref(),
                 permission_profile.as_deref(),
                 model_override.as_deref(),
                 developer_prompt.as_deref(),
-            ) {
+            );
+            drop(reply_scope);
+            match resumed {
                 Ok(r) => {
                     // Pending questions/approvals survive reconnects; the host
                     // re-issues their requests, which the normal bridge picks
@@ -6104,6 +6260,8 @@ fn handle_acp(
                         }
                     };
                     let title_update: Option<HostTitleUpdate>;
+                    let mut replay_result = (false, Vec::new());
+                    let mut pressure = None;
                     {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
@@ -6221,12 +6379,6 @@ fn handle_acp(
                             );
                         }
                         title_update = HostTitleUpdate::after(&title_before, &entry.title_facts);
-                        // A side chat names the session it was opened from; a
-                        // fork names its cut point. Publish the provenance on
-                        // attach so the parent link survives a reload.
-                        if let Some(muse) = session_provenance_meta(r.get("session")) {
-                            acp::send_session_provenance(stdout, entry, &muse);
-                        }
                         // Usage the host already knows, restored from the
                         // snapshot rather than from message replay: Muse
                         // subscribes after the returned view head, so the
@@ -6242,7 +6394,6 @@ fn handle_acp(
                         // object itself so a reattach whose snapshot carries no
                         // occupancy keeps what the session already knows
                         // instead of having it blanked back to silence.
-                        let mut pressure: Option<String> = None;
                         if let Some(state) = snapshot_state(&r) {
                             // Muse 1.4.15 retained monitor inbox admissions,
                             // before any replay renders a monitor card.
@@ -6258,14 +6409,6 @@ fn handle_acp(
                                 adopt_cumulative(entry, tu);
                             }
                             adopt_reasoning_effort(entry, state);
-                            // The todo list is part of the folded snapshot:
-                            // restore the plan so a resumed session shows its
-                            // task state before the next live change.
-                            if let Some(todo) = state.get("todoList")
-                                && matches!(todo, J::Obj(_))
-                            {
-                                acp::send_plan(stdout, &sid, entry.ver, todo.get("items"));
-                            }
                             // Goal and branch are folded snapshot facts too:
                             // adopt them so session metadata survives attach.
                             if let Some(goal) = state.get("goal") {
@@ -6274,14 +6417,6 @@ fn handle_acp(
                             if let Some(branch) = state.get("branch") {
                                 entry.branch_meta = Some(j_to_string(branch));
                             }
-                            let goal = entry.goal_meta.clone();
-                            let branch = entry.branch_meta.clone();
-                            acp::send_session_meta(
-                                stdout,
-                                entry,
-                                goal.as_deref(),
-                                branch.as_deref(),
-                            );
                         }
                         if replay {
                             // A load replays the whole conversation (ACP v1
@@ -6291,17 +6426,90 @@ fn handle_acp(
                             // through a fresh fold.
                             let root = entry.fold.workspace_root.clone();
                             entry.fold = fresh_fold(&root);
-                            let complete = replay_history(stdout, entry, &r, replay_start);
-                            // ACP v2 marks the end of a requested replay, so
-                            // the editor can tell history from live updates.
-                            // A partial replay is left unmarked, which ACP
-                            // defines as a truncated one.
-                            if ver == 2 && complete {
-                                let acp_sid = entry.acp_sid.clone();
-                                acp::send_note(stdout, out::replay_complete(&acp_sid));
-                            } else if ver == 2 {
-                                log("resume: replay incomplete; replay_complete withheld");
+                            replay_result = replay_history(stdout, entry, &r, replay_start);
+                        }
+                    }
+                    if ver == 2 && replay {
+                        let (complete, replay_children) = replay_result;
+                        // Prepare passive child readback before any marker. A
+                        // failed selection still leaves the retained root.
+                        let children = complete
+                            .then(|| {
+                                replay_children
+                                    .into_iter()
+                                    .map(|child| {
+                                        let history =
+                                            replay_child_history(host, &real_msp, &child)?;
+                                        Some((child, history))
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            })
+                            .flatten();
+                        let Some(children) = children else {
+                            if !previously_active {
+                                sessions
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&sid);
                             }
+                            acp::send_error_with_data(
+                                stdout,
+                                &id,
+                                -32603,
+                                "Muse could not complete the requested replay",
+                                r#"{"_meta":{"nymph.ai/fabric":{"replayIncomplete":true}}}"#,
+                            );
+                            return;
+                        };
+                        let mut synchronized = Vec::new();
+                        for (child, history) in children {
+                            for note in history {
+                                acp::send_note(stdout, note);
+                            }
+                            acp::send_note(stdout, out::replay_complete(&child));
+                            synchronized.push(child);
+                        }
+                        acp::send_note(stdout, out::replay_complete(&sid));
+                        for child in synchronized {
+                            acp::send_state(stdout, &child, "idle", None);
+                            acp::send_note(
+                                stdout,
+                                out::subagent_update(
+                                    &sid,
+                                    ver,
+                                    out::Subagent {
+                                        session_id: child,
+                                        title: None,
+                                        description: None,
+                                        state: Some(out::ChildState::Completed),
+                                        meta: None,
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(entry) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_mut(&sid)
+                    {
+                        if let Some(muse) = session_provenance_meta(r.get("session")) {
+                            acp::send_session_provenance(stdout, entry, &muse);
+                        }
+                        if let Some(state) = snapshot_state(&r) {
+                            if let Some(todo) = state.get("todoList")
+                                && matches!(todo, J::Obj(_))
+                            {
+                                acp::send_plan(stdout, &sid, entry.ver, todo.get("items"));
+                            }
+                            let goal = entry.goal_meta.clone();
+                            let branch = entry.branch_meta.clone();
+                            acp::send_session_meta(
+                                stdout,
+                                entry,
+                                goal.as_deref(),
+                                branch.as_deref(),
+                            );
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(
@@ -6530,6 +6738,9 @@ fn handle_acp(
         }
         Request::ForkSession(setup) => {
             let ver = negotiated_ver();
+            if !validate_channel_reply_setup(host, stdout, &id, &setup.mcp_servers, None) {
+                return;
+            }
             let src_sid = setup.session_id.clone();
             if src_sid.is_empty() {
                 acp::send_error(
@@ -6944,6 +7155,10 @@ fn handle_acp(
             let ver = negotiated_ver();
             let report_request = file_report_request(&prompt.meta);
             let sid = prompt.session_id.clone();
+            if close_pending(&sid) {
+                acp::send_error(stdout, &id, -32800, "Muse session is closing");
+                return;
+            }
             let (
                 msp_sid,
                 cwd,
@@ -6972,7 +7187,12 @@ fn handle_acp(
                     s.host_roots_pending,
                 ),
                 None => {
-                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        if ver == 2 { -32002 } else { -32602 },
+                        "unknown sessionId",
+                    );
                     return;
                 }
             };
@@ -6995,7 +7215,7 @@ fn handle_acp(
                     );
                     return;
                 }
-                let key = match prompt_keys::Key::new(&msp_sid, key, &input) {
+                let key = match prompt_keys::Key::new(&msp_sid, key, &input, &prompt.blocks) {
                     Ok(key) => key,
                     Err(error) => {
                         acp::send_error(stdout, &id, -32603, &error.to_string());
@@ -7218,6 +7438,7 @@ fn handle_acp(
                                 queued: false,
                                 file_report: report_request.map(new_file_report),
                                 keyed_prompt: None,
+                                cursor_prompt: None,
                                 declined_retract_notified: false,
                             });
                             s.active_turn = Some(turn.to_string());
@@ -7483,6 +7704,15 @@ fn handle_acp(
                 None => None,
             };
             let is_keyed = pending.is_some();
+            let cursor_prompt = match &acp_content {
+                out::Echo::V2(blocks) if !planning => match blocks.as_slice() {
+                    [agent_client_protocol::v2::schema::ContentBlock::Text(text)] => {
+                        Some((cmd.clone(), text.text.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
             match turn_command(
                 host,
                 &msp_sid,
@@ -7522,6 +7752,7 @@ fn handle_acp(
                             req_id: id.clone(),
                             queued: !started,
                             keyed_prompt: pending,
+                            cursor_prompt,
                             file_report: report_request.map(new_file_report),
                             declined_retract_notified: false,
                         });
@@ -8203,6 +8434,7 @@ fn handle_acp(
                     queued: false,
                     file_report: None,
                     keyed_prompt: None,
+                    cursor_prompt: None,
                     declined_retract_notified: false,
                 });
             }
@@ -8241,8 +8473,6 @@ fn handle_acp(
             }
         }
         Request::CloseSession { session_id } => {
-            // v2 baseline: stop session work, drop local state, resolve
-            // pending client interactions as cancelled, return {}.
             let sid = session_id.clone();
             if sid.is_empty() {
                 acp::send_error(
@@ -8251,6 +8481,10 @@ fn handle_acp(
                     -32602,
                     "session/close requires params.sessionId",
                 );
+                return;
+            }
+            if negotiated_ver() == 2 {
+                begin_native_close(host, stdout, sessions, &sid, id);
                 return;
             }
             cancel_session_turns(host, sessions, &sid);
@@ -9222,6 +9456,62 @@ fn collect_history(
     }
 }
 
+fn issue_settled_chat_cursor(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    msp_sid: &str,
+    turn_id: &str,
+    command: &str,
+    text: &str,
+) {
+    let Ok(read) = host.command(
+        "session/read",
+        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
+    ) else {
+        return;
+    };
+    let Some(session) = read.get("session") else {
+        return;
+    };
+    let retained_terminal = read.get("lastTurn").is_some_and(|last| {
+        last.non_empty_str("turnId") == Some(turn_id)
+            && last.non_empty_str("terminal") == Some("completed")
+    });
+    if session.non_empty_str("sessionId") != Some(msp_sid)
+        || session.non_empty_str("kind") != Some("root")
+        || !matches!(session.get("activeTurnId"), Some(J::Null))
+        || !retained_terminal
+        || !inline_history(&read)
+        || !matches!(read.get("pendingRequests"), Some(J::Arr(items)) if items.is_empty())
+        || ["prunedSubagents", "queuedInputs"]
+            .iter()
+            .any(|key| matches!(read.get(key), Some(J::Arr(items)) if !items.is_empty()))
+        || read
+            .get("history")
+            .is_some_and(|history| history.get("checkpointBoundary").is_some())
+    {
+        return;
+    }
+    let Some(J::Arr(items)) = read.get("history").and_then(|history| history.get("items")) else {
+        return;
+    };
+    let Some(boundary) =
+        fork_cursors::settled_chat_boundary(acp_sid, msp_sid, items, turn_id, command, text)
+    else {
+        return;
+    };
+    match fork_cursors::remember(msp_sid, acp_sid, &boundary.id) {
+        Ok(()) => acp::send_note(
+            stdout,
+            out::fork_cursor(acp_sid, &boundary.id, boundary.anchor_message),
+        ),
+        Err(error) => log(&format!(
+            "completed turn: could not retain fork cursor: {error}"
+        )),
+    }
+}
+
 fn resolve_native_fork_cursor(
     host: &Arc<Hosts>,
     acp_sid: &str,
@@ -9265,19 +9555,18 @@ fn inline_history(resume_res: &J) -> bool {
         == Some("inline")
 }
 
-/// Replays the history a `session/resume` result served. Returns whether
-/// the replay is complete: the host served the whole history inline, in a
-/// shape the fold reads. A downgraded or unreadable history replays what it
-/// can and answers false.
+/// Replays the parent's history and collects the exact first-level children
+/// it announced. The caller reads children's transcripts outside the lock
+/// before ending a complete ACP v2 replay.
 fn replay_history(
     stdout: &StdoutShared,
     sess: &mut AcpSession,
     resume_res: &J,
     start: usize,
-) -> bool {
+) -> (bool, Vec<String>) {
     let Some(items) = replay_items(resume_res) else {
         log("resume: unrecognized history shape; resumed without replay");
-        return false;
+        return (false, Vec::new());
     };
     let mut out = Vec::new();
     let (acp_sid, ver) = (sess.acp_sid.clone(), sess.ver);
@@ -9289,21 +9578,66 @@ fn replay_history(
     }
     sess.fold
         .replay_history_items(&acp_sid, ver, &items[start..], &mut out);
-    let complete = inline_history(resume_res);
-    let user_messages = if complete && ver == 2 {
+    let inline = inline_history(resume_res);
+    let mut complete = inline
+        && !matches!(resume_res.get("prunedSubagents"), Some(J::Arr(pruned)) if !pruned.is_empty());
+    let mut user_messages = std::collections::HashSet::new();
+    let mut children = Vec::new();
+    if inline && ver == 2 {
         use agent_client_protocol::v2::schema::SessionUpdate;
-        out.iter()
-            .filter_map(|note| match note {
-                out::Note::V2(note) => match &note.update {
-                    SessionUpdate::UserMessage(message) => Some(message.message_id.to_string()),
-                    _ => None,
-                },
-                _ => None,
+        let direct_children: std::collections::HashSet<_> = items[start..]
+            .iter()
+            .filter(|item| {
+                item.non_empty_str("kind") == Some("subagent")
+                    && item.get("depth").and_then(J::as_u64) == Some(1)
+                    && item.non_empty_str("parentSubagentId").is_none()
+                    && !matches!(item.get("historyUnreadable"), Some(J::Bool(true)))
             })
-            .collect::<std::collections::HashSet<_>>()
-    } else {
-        Default::default()
-    };
+            .filter_map(|item| item.non_empty_str("childSessionId"))
+            .collect();
+        let mut typed = if resume_res
+            .get("session")
+            .and_then(|session| session.non_empty_str("sessionId"))
+            == Some(sess.msp_sid.as_str())
+            && resume_res.get("history").is_some_and(|history| {
+                matches!(history.get("items"), Some(J::Arr(_)))
+                    && history.get("checkpointBoundary").is_none()
+            })
+            && !items
+                .iter()
+                .any(|item| item.non_empty_str("kind") == Some("damagedRange"))
+        {
+            prompt_keys::replay_resources(&sess.msp_sid, items)
+        } else {
+            HashMap::new()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for note in &mut out {
+            if let out::Note::V2(note) = note {
+                match &mut note.update {
+                    SessionUpdate::UserMessage(message) => {
+                        let id = message.message_id.to_string();
+                        if let Some(content) = typed.remove(&id) {
+                            message.content =
+                                agent_client_protocol::schema::MaybeUndefined::Value(content);
+                        }
+                        user_messages.insert(id);
+                    }
+                    SessionUpdate::SubagentUpdate(update) => {
+                        let child = update.session_id.to_string();
+                        if seen.insert(child.clone()) {
+                            if child != sess.msp_sid && direct_children.contains(child.as_str()) {
+                                children.push(child);
+                            } else {
+                                complete = false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     acp::send_fold_lines(stdout, sess, out);
     if !user_messages.is_empty() {
         for boundary in fork_cursors::boundaries(&acp_sid, &sess.msp_sid, items) {
@@ -9318,7 +9652,72 @@ fn replay_history(
             }
         }
     }
-    complete
+    (complete, children)
+}
+
+/// The retained parent item establishes which child to read. The MSP reply
+/// must independently name that exact rooted child before sending content.
+fn replay_child_history(host: &Arc<Hosts>, parent: &str, child: &str) -> Option<Vec<out::Note>> {
+    let owner = host.owner(parent);
+    if host.known_owner(child).is_some_and(|known| known != owner) {
+        return None;
+    }
+    let native = match owner {
+        HostKind::Main => Ok(host.main_host()),
+        HostKind::ReadOnly => host.read_only_host(),
+        HostKind::Reviewer => host.reviewer_host(),
+    };
+    let Ok(native) = native else {
+        return None;
+    };
+    let Ok(read) = native.command(
+        "session/read",
+        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(child)),
+    ) else {
+        return None;
+    };
+    let session = read.get("session")?;
+    if session.non_empty_str("sessionId") != Some(child)
+        || session.non_empty_str("kind") != Some("subagent")
+        || session.non_empty_str("parentSessionId") != Some(parent)
+        || session.non_empty_str("activeTurnId").is_some()
+        || read
+            .get("modelTurnRunning")
+            .is_some_and(|v| matches!(v, J::Bool(true)))
+        || read
+            .get("lastTurn")
+            .and_then(|turn| turn.non_empty_str("terminal"))
+            != Some("completed")
+        || !inline_history(&read)
+    {
+        return None;
+    }
+
+    let items = replay_items(&read)?;
+    // This readback renders settled text. Refuse an end-of-replay assertion
+    // for child surfaces whose full representation is unverified.
+    let plain_text = |item: &J| {
+        matches!(
+            item.non_empty_str("kind"),
+            Some("userMessage" | "agentMessage")
+        ) && item.non_empty_str("itemId").is_some()
+            && item.non_empty_str("status") == Some("completed")
+            && item.non_empty_str("text").is_some()
+            && item.get("attachments").is_none_or(|attachments| {
+                matches!(attachments, J::Null)
+                    || matches!(attachments, J::Arr(items) if items.is_empty())
+            })
+            && !["truncated", "cutOff"]
+                .iter()
+                .any(|key| matches!(item.get(key), Some(J::Bool(true))))
+    };
+    if items.is_empty() || !items.iter().all(plain_text) {
+        return None;
+    }
+    let mut fold = fresh_fold(session.non_empty_str("workspaceRoot").unwrap_or(""));
+    let mut out = Vec::new();
+    fold.replay_history_items(child, 2, items, &mut out);
+    Some(out)
 }
 
 /// Rebuild the observable AIR task set from the durable fold returned by
@@ -11687,7 +12086,194 @@ fn answer_delete_waiters(
     }
 }
 
-/// Remove one pending delete by command id.
+fn close_pending(acp_sid: &str) -> bool {
+    CLOSES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(acp_sid)
+}
+
+fn begin_native_close(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    id: Option<RequestId>,
+) {
+    let mut closes = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(close) = closes.get_mut(acp_sid) {
+        close.waiters.extend(id);
+        return;
+    }
+    let target = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .map(|session| {
+            (
+                session.msp_sid.clone(),
+                session_stop_targets(session)
+                    .into_iter()
+                    .map(|(_, turn, _)| turn)
+                    .collect(),
+            )
+        });
+    let Some((msp_sid, turns)) = target else {
+        acp::send_done(stdout, &id, acp::Done::CloseSession);
+        return;
+    };
+    if !host.handshake().at_least(1, 4, 11) {
+        acp::send_error(
+            stdout,
+            &id,
+            -32603,
+            "Muse cannot confirm native session close",
+        );
+        return;
+    }
+    let command_id = host.mint_cmd("cmd-");
+    let leave = host.command(
+        "session/leave",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"stop\":true}}",
+            esc(&command_id),
+            esc(&msp_sid)
+        ),
+    );
+    if !leave.is_ok_and(|ack| {
+        ack.non_empty_str("commandId") == Some(command_id.as_str())
+            && ack.non_empty_str("status") == Some("accepted")
+    }) {
+        acp::send_error(
+            stdout,
+            &id,
+            -32603,
+            "Muse did not admit native session close",
+        );
+        return;
+    }
+    closes.insert(
+        acp_sid.to_string(),
+        PendingClose {
+            command_id,
+            host_kind: host.owner(&msp_sid),
+            msp_sid,
+            waiters: id.into_iter().collect(),
+            turns,
+            released: false,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(15),
+        },
+    );
+}
+
+fn close_turn_settled(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    msp_sid: &str,
+    turn_id: &str,
+) {
+    {
+        let mut closes = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(close) = closes
+            .get_mut(acp_sid)
+            .filter(|close| close.msp_sid == msp_sid)
+        else {
+            return;
+        };
+        close.turns.remove(turn_id);
+    }
+    finish_native_close(stdout, sessions, acp_sid);
+}
+
+fn observe_close_release(stdout: &StdoutShared, sessions: &Sessions, params: &J) -> bool {
+    let (Some(msp_sid), Some(command_id)) = (
+        params.non_empty_str("sessionId"),
+        params.non_empty_str("commandId"),
+    ) else {
+        return false;
+    };
+    let acp_sid = {
+        let mut closes = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((acp_sid, close)) = closes
+            .iter_mut()
+            .find(|(_, close)| close.command_id == command_id && close.msp_sid == msp_sid)
+        else {
+            return false;
+        };
+        let acp_sid = acp_sid.clone();
+        if params.non_empty_str("outcome") != Some("released")
+            || params.non_empty_str("viewCursor").is_none()
+        {
+            let failed = closes.remove(&acp_sid).expect("the close is pending");
+            for waiter in failed.waiters {
+                acp::send_error(
+                    stdout,
+                    &Some(waiter),
+                    -32603,
+                    "Muse did not confirm native session release",
+                );
+            }
+            return true;
+        }
+        close.released = true;
+        acp_sid
+    };
+    finish_native_close(stdout, sessions, &acp_sid);
+    true
+}
+
+fn finish_native_close(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let mut closes = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
+    if !closes
+        .get(acp_sid)
+        .is_some_and(|close| close.released && close.turns.is_empty())
+    {
+        return;
+    }
+    // Do not drop a newly discovered turn or call a synthetic idle the
+    // native terminal. A later exact terminal can finish this close.
+    if sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .is_some_and(|session| !session_stop_targets(session).is_empty())
+    {
+        return;
+    }
+    let close = closes.remove(acp_sid).expect("the close is pending");
+    drop(closes);
+    bridge::cancel_session(acp_sid);
+    drop_acp_session(stdout, sessions, acp_sid);
+    for waiter in close.waiters {
+        acp::send_done(stdout, &Some(waiter), acp::Done::CloseSession);
+    }
+}
+
+fn fail_native_closes(
+    stdout: &StdoutShared,
+    matches: impl Fn(&PendingClose) -> bool,
+    message: &str,
+) {
+    let mut closes = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
+    let failed: Vec<_> = closes.extract_if(|_, close| matches(close)).collect();
+    drop(closes);
+    for (_, close) in failed {
+        for waiter in close.waiters {
+            acp::send_error(stdout, &Some(waiter), -32603, message);
+        }
+    }
+}
+
+fn expire_native_closes(stdout: &StdoutShared) {
+    let now = std::time::Instant::now();
+    fail_native_closes(
+        stdout,
+        |close| close.deadline <= now,
+        "Muse did not confirm native session close before the deadline",
+    );
+}
+
 /// Release a closed session on hosts that can (Muse 1.4.11 `session/leave`),
 /// so it stops holding host resources until Muse would have idle-unloaded
 /// it. The ACP close has already stopped the session's work; `stop` asks the
@@ -11750,6 +12336,7 @@ fn leave_session(host: &Arc<Hosts>, msp_sid: &str) {
     }
 }
 
+/// Remove one pending delete by command id.
 fn take_pending_delete(cmd: &str) -> Option<PendingDelete> {
     DELETES
         .lock()
@@ -12542,6 +13129,7 @@ fn handle_msp(
                     let mut finished = pos.map(|p| s.in_flight.remove(p));
                     let req_id = finished.as_ref().map(|f| f.req_id.clone());
                     let keyed = finished.as_mut().and_then(|f| f.keyed_prompt.take());
+                    let cursor_prompt = finished.as_mut().and_then(|f| f.cursor_prompt.take());
                     let file_report = finished.and_then(|f| f.file_report);
                     let rest = s.in_flight.len();
                     // The turn's model-call legs, summed. Every completion's
@@ -12549,13 +13137,15 @@ fn handle_msp(
                     // that precedes this terminal record, so they have all
                     // arrived by now; a turn that reported none carries none.
                     let usage = acp::take_turn_usage(s, turn_id).and_then(|u| u.result_usage());
-                    (req_id, ver, rest, usage, file_report, keyed)
+                    (req_id, ver, rest, usage, file_report, keyed, cursor_prompt)
                 });
-            if let Some((req_id, ver, rest, usage, file_report, keyed)) = settled {
+            if let Some((req_id, ver, rest, usage, file_report, keyed, cursor_prompt)) = settled {
                 let deferred_start_failure = error_kind == "launchError";
                 if let Some(pending) = keyed {
-                    if retained_prompt(host, msp_sid, &pending.receipt.command_id) {
-                        confirm_keyed_prompt(stdout, &acp_sid, pending);
+                    if let Some(item) = retained_prompt(host, msp_sid, &pending.receipt.command_id)
+                        .filter(|item| pending.receipt.accepts_recovery(item))
+                    {
+                        confirm_keyed_prompt(stdout, &acp_sid, pending, &item);
                     } else {
                         end_keyed_prompt(stdout, Some(pending), deferred_start_failure);
                     }
@@ -12592,6 +13182,13 @@ fn handle_msp(
                     // Idle only when no session work remains; otherwise
                     // re-assert running so queued work isn't misreported.
                     if rest == 0 {
+                        if terminal == "completed"
+                            && let Some((command, text)) = cursor_prompt
+                        {
+                            issue_settled_chat_cursor(
+                                host, stdout, &acp_sid, msp_sid, turn_id, &command, &text,
+                            );
+                        }
                         acp::send_state(stdout, &acp_sid, "idle", Some(stop));
                     } else {
                         acp::send_state(stdout, &acp_sid, "running", None);
@@ -12613,6 +13210,9 @@ fn handle_msp(
                 } else {
                     log(&format!("turn/completed for untracked turn {turn_id}"));
                 }
+            }
+            if matches!(terminal, "completed" | "failed" | "cancelled") {
+                close_turn_settled(stdout, sessions, &acp_sid, msp_sid, turn_id);
             }
         }
         "turn/unqueued" => {
@@ -12663,6 +13263,7 @@ fn handle_msp(
                 }
                 let _ = req_id;
             }
+            close_turn_settled(stdout, sessions, &acp_sid, msp_sid, turn_id);
         }
         "approval/requested" => {
             open_approval(host, stdout, sessions, params);
@@ -13492,9 +14093,11 @@ fn handle_msp(
 
         "account/loginCompleted" => finish_device_login(host, stdout, params),
         "session/leaveCompleted" => {
-            // The terminal for an admitted `session/leave`. The ACP session
-            // is already closed, so this settles nothing; it records whether
-            // Muse released the session. `outcome` and `reason` are open.
+            // The terminal gates v2 close. For legacy leave it only
+            // records whether Muse released the already detached session.
+            if observe_close_release(stdout, sessions, params) {
+                return;
+            }
             let cmd = params.get("commandId").and_then(J::as_str).unwrap_or("");
             let msp_sid = params.get("sessionId").and_then(J::as_str).unwrap_or("");
             let outcome = params
