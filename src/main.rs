@@ -11,6 +11,7 @@ mod diff;
 mod editor;
 mod efforts;
 mod fold;
+mod fork_cursors;
 mod host_config;
 mod hosts;
 mod json;
@@ -2037,7 +2038,12 @@ enum LoopMsg {
 /// must not call `session/delete` unless it is advertised. `system_prompt`
 /// is the host's developer prompt support (Muse 1.4.18+), advertised as
 /// `systemPrompt` in `append` mode only.
-fn v2_init(session_mcp: bool, session_delete: bool, system_prompt: bool) -> serde_json::Value {
+fn v2_init(
+    session_mcp: bool,
+    session_delete: bool,
+    system_prompt: bool,
+    keyed_text_prompts: bool,
+) -> serde_json::Value {
     use agent_client_protocol::{schema::ProtocolVersion, v2::schema as s2};
     let mut session = s2::SessionCapabilities::new()
         .prompt(
@@ -2064,7 +2070,7 @@ fn v2_init(session_mcp: bool, session_delete: bool, system_prompt: bool) -> serd
     let response = s2::InitializeResponse::new(ProtocolVersion::V2, info)
         .capabilities(s2::AgentCapabilities::new().session(session))
         .auth_methods(auth_methods_v2())
-        .meta(initialize_meta(Some(MUSE_CAPABILITIES)));
+        .meta(initialize_meta(Some(MUSE_CAPABILITIES), keyed_text_prompts));
     serde_json::to_value(response).expect("an initialize response serializes")
 }
 
@@ -2099,7 +2105,7 @@ fn v1_init(session_mcp: bool, session_delete: bool, system_prompt: bool) -> serd
         .auth_methods(auth_methods_v1())
         .agent_capabilities(capabilities)
         .agent_info(info)
-        .meta(initialize_meta(None));
+        .meta(initialize_meta(None, false));
     let mut response = serde_json::to_value(response).expect("an initialize response serializes");
     // AIR reads native subagent support from the earlier subagents draft's
     // agent capability, which the v1 schema no longer defines; only AIR
@@ -2120,9 +2126,12 @@ const MUSE_CAPABILITIES: &str = r#""muse":{"capabilities":["computerUse","hooks"
 /// The `initialize` response's top-level `_meta`: the steering extension,
 /// `muse` when given, and, for an AIR client only, the agent side of the AIR
 /// extension.
-fn initialize_meta(muse: Option<&str>) -> Option<out::Meta> {
+fn initialize_meta(muse: Option<&str>, keyed_text_prompts: bool) -> Option<out::Meta> {
     let mut members: Vec<&str> = muse.into_iter().collect();
     members.push(r#""steering":{"supported":true,"idleBehaviors":["promptRequired"]}"#);
+    if keyed_text_prompts {
+        members.push(r#""nymph.ai/fabric":{"keyedTextPrompts":true}"#);
+    }
     if AIR_CLIENT.load(Ordering::SeqCst) {
         members.push(
             r#""jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}"#,
@@ -2137,9 +2146,15 @@ fn send_initialize(
     session_mcp: bool,
     session_delete: bool,
     system_prompt: bool,
+    host_available: bool,
 ) {
     let response = if negotiated_ver() == 2 {
-        v2_init(session_mcp, session_delete, system_prompt)
+        v2_init(
+            session_mcp,
+            session_delete,
+            system_prompt,
+            host_available && prompt_keys::available(),
+        )
     } else {
         v1_init(session_mcp, session_delete, system_prompt)
     };
@@ -2156,7 +2171,7 @@ fn serve_without_host(
     reason: &str,
 ) {
     match request.method() {
-        "initialize" => send_initialize(stdout, id, false, false, false),
+        "initialize" => send_initialize(stdout, id, false, false, false, false),
         // Auth-required, so clients show the button that installs Muse.
         _ if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
             let message = if login_method_offered() {
@@ -3369,7 +3384,7 @@ fn selftest() -> i32 {
     {
         AIR_CLIENT.store(air, Ordering::SeqCst);
         let (response, parsed) = if v2 {
-            let response = v2_init(session_mcp, session_delete, system_prompt);
+            let response = v2_init(session_mcp, session_delete, system_prompt, true);
             let parsed = serde_json::from_value::<
                 agent_client_protocol::v2::schema::InitializeResponse,
             >(response.clone())
@@ -5517,6 +5532,7 @@ fn handle_acp(
             host.handshake().session_mcp,
             host.handshake().supports_session_delete(),
             host.handshake().supports_developer_prompt(),
+            true,
         ),
         Request::NewSession(setup) => {
             let ver = negotiated_ver();
@@ -6481,15 +6497,6 @@ fn handle_acp(
             }
         }
         Request::ForkSession(setup) => {
-            if setup.fork_cursor.is_some() {
-                acp::send_error(
-                    stdout,
-                    &id,
-                    -32602,
-                    "Muse has not issued a fork cursor for this session",
-                );
-                return;
-            }
             let ver = negotiated_ver();
             let src_sid = setup.session_id.clone();
             if src_sid.is_empty() {
@@ -6535,11 +6542,6 @@ fn handle_acp(
                     return;
                 }
             };
-            // MSP session/fork takes no configuration, and the fork is loaded
-            // without MCP servers. Keep the client's set on the record so a
-            // restarted host loads the fork with it.
-            let (mcp_servers, bridge_token) =
-                session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, false, None);
             // Resolve the source MSP session: known ACP session first, then
             // preserved metadata (same rule as resume).
             let meta_msp_sid = meta_msp_session_id(&setup.meta);
@@ -6550,6 +6552,17 @@ fn handle_acp(
                 .map(|s| s.msp_sid.clone())
                 .or(meta_msp_sid)
                 .unwrap_or_else(|| src_sid.clone());
+            if let Some(cursor) = &setup.fork_cursor
+                && (ver != 2 || !fork_cursors::was_issued(&msp_sid, &src_sid, cursor))
+            {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "Muse has not issued this fork cursor for the session",
+                );
+                return;
+            }
             let parent_reasoning = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -6574,13 +6587,23 @@ fn handle_acp(
             }
             let fork_host = host.owner(&msp_sid);
             let fork_mode = mode_on_host(source_mode, fork_host);
-            let cut_point = match resolve_fork_cut_point(host, &msp_sid, &setup.meta) {
+            let cut_point = if let Some(cursor) = &setup.fork_cursor {
+                resolve_native_fork_cursor(host, &src_sid, &msp_sid, cursor).map(Some)
+            } else {
+                resolve_fork_cut_point(host, &msp_sid, &setup.meta)
+            };
+            let cut_point = match cut_point {
                 Ok(c) => c,
                 Err(e) => {
                     acp::send_error(stdout, &id, -32602, &e);
                     return;
                 }
             };
+            // MSP session/fork takes no configuration, and the fork is loaded
+            // without MCP servers. Keep the client's set on the record so a
+            // restarted host loads the fork with it.
+            let (mcp_servers, bridge_token) =
+                session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, false, None);
             let cmd = host.mint_cmd("cmd-");
             let cut_json = match &cut_point {
                 Some(turn) => format!(",\"cutPoint\":{{\"lastTurnId\":{}}}", esc(turn)),
@@ -9159,6 +9182,26 @@ fn collect_history(
     }
 }
 
+fn resolve_native_fork_cursor(
+    host: &Arc<Hosts>,
+    acp_sid: &str,
+    msp_sid: &str,
+    cursor: &str,
+) -> Result<String, String> {
+    let read = host
+        .command(
+            "session/read",
+            &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
+        )
+        .map_err(|e| format!("fork cursor history read failed: {}", err_message(&e)))?;
+    let (items, _) = collect_history(host, msp_sid, &read)?;
+    fork_cursors::boundaries(acp_sid, msp_sid, &items)
+        .into_iter()
+        .find(|boundary| boundary.id == cursor)
+        .map(|boundary| boundary.last_turn.to_owned())
+        .ok_or_else(|| "Muse no longer retains the exact fork cursor boundary".to_owned())
+}
+
 /// Replays the history a `session/resume` result served. Returns whether
 /// the replay is complete: the host served the whole history inline, in a
 /// shape the fold reads. A downgraded or unreadable history replays what it
@@ -9172,12 +9215,40 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     let (acp_sid, ver) = (sess.acp_sid.clone(), sess.ver);
     sess.fold
         .replay_history_items(&acp_sid, ver, &items, &mut out);
-    acp::send_fold_lines(stdout, sess, out);
-    resume_res
+    let complete = resume_res
         .get("history")
         .and_then(|h| h.get("mode"))
         .and_then(J::as_str)
-        == Some("inline")
+        == Some("inline");
+    let user_messages = if complete && ver == 2 {
+        use agent_client_protocol::v2::schema::SessionUpdate;
+        out.iter()
+            .filter_map(|note| match note {
+                out::Note::V2(note) => match &note.update {
+                    SessionUpdate::UserMessage(message) => Some(message.message_id.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        Default::default()
+    };
+    acp::send_fold_lines(stdout, sess, out);
+    if !user_messages.is_empty() {
+        for boundary in fork_cursors::boundaries(&acp_sid, &sess.msp_sid, &items) {
+            if user_messages.contains(boundary.anchor_message) {
+                match fork_cursors::remember(&sess.msp_sid, &acp_sid, &boundary.id) {
+                    Ok(()) => acp::send_note(
+                        stdout,
+                        out::fork_cursor(&acp_sid, &boundary.id, boundary.anchor_message),
+                    ),
+                    Err(error) => log(&format!("resume: could not retain fork cursor: {error}")),
+                }
+            }
+        }
+    }
+    complete
 }
 
 /// Rebuild the observable AIR task set from the durable fold returned by
@@ -11648,6 +11719,7 @@ fn forget_deleted_session(
     }
     modes::forget(msp_sid);
     prompt_keys::forget_session(msp_sid);
+    fork_cursors::forget_session(msp_sid);
     host.forget_owner(msp_sid);
 }
 
@@ -18375,10 +18447,10 @@ mod tests {
     #[test]
     fn initialization_payloads_report_the_cargo_version() {
         for payload in [
-            v2_init(true, true, true),
-            v2_init(true, false, true),
-            v2_init(false, true, false),
-            v2_init(false, false, false),
+            v2_init(true, true, true, true),
+            v2_init(true, false, true, false),
+            v2_init(false, true, false, true),
+            v2_init(false, false, false, false),
             v1_init(true, true, true),
             v1_init(true, false, true),
             v1_init(false, true, false),

@@ -970,6 +970,22 @@ pub fn replay_complete(acp_sid: &str) -> Note {
     )
 }
 
+pub fn fork_cursor(acp_sid: &str, cursor: &str, anchor_message: &str) -> Note {
+    Note::v2(
+        acp_sid,
+        s2::SessionUpdate::CursorUpdate(
+            s2::CursorUpdate::new(cursor.to_owned())
+                .anchor(s2::CursorAnchor::UserMessage(s2::CursorMessageAnchor::new(
+                    anchor_message.to_owned(),
+                    s2::CursorAnchorPosition::Before,
+                )))
+                .capabilities(
+                    s2::CursorCapabilities::new().fork(s2::CursorForkCapabilities::new()),
+                ),
+        ),
+    )
+}
+
 /// One todo item of a session plan: its text and ACP entry status
 /// (`pending`, `in_progress`, `completed`), at medium priority.
 pub type PlanEntry = (String, &'static str);

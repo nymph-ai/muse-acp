@@ -544,6 +544,70 @@ fn v2_keyed_prompt_reuses_its_real_msp_receipt_after_adapter_restart() {
 }
 
 #[test]
+fn v2_forks_at_an_issued_boundary_in_real_msp_history() {
+    if !enabled("v2_forks_at_an_issued_boundary_in_real_msp_history") {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
+    let mut writer = Adapter::launch(&host);
+    let source = writer.new_session(&host, json!([]));
+    writer.turn(&source, "first prompt [[script:hello]]");
+    writer.turn(&source, "second prompt [[script:hello]]");
+    writer.finish();
+
+    let resume = |session: &str| {
+        json!({
+            "sessionId": session, "cwd": host.workspace(), "replayFrom": {"type": "start"}
+        })
+    };
+    let mut reader = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let replay = reader.request("session/resume", resume(&source));
+    reader.result(replay);
+    let updates = reader.updates("cursor_update");
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    let cursor = &updates[0];
+    assert_eq!(cursor["capabilities"]["fork"], json!({}));
+    let messages = reader.updates("user_message");
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(
+        cursor["anchor"],
+        json!({
+            "type": "user_message", "position": "before", "messageId": messages[1]["messageId"]
+        })
+    );
+    reader.finish();
+
+    let mut reconnect = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let other = reconnect.new_session(&host, json!([]));
+    let foreign = reconnect.request(
+        "session/fork",
+        json!({"sessionId": other, "cwd": host.workspace(), "cursorId": cursor["cursorId"]}),
+    );
+    assert_eq!(reconnect.response(foreign)["error"]["code"], -32602);
+    let fork = reconnect.request(
+        "session/fork",
+        json!({
+            "sessionId": source, "cwd": host.workspace(), "cursorId": cursor["cursorId"]
+        }),
+    );
+    let fork = reconnect.result(fork);
+    let child = fork["sessionId"].as_str().unwrap();
+    assert_ne!(child, source);
+    let replay = reconnect.request("session/resume", resume(child));
+    reconnect.result(replay);
+    let copied = reconnect.updates("user_message");
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    assert!(
+        copied[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("first prompt")
+    );
+    assert_eq!(reconnect.updates("agent_message").len(), 1);
+    reconnect.finish();
+}
+
+#[test]
 fn an_approved_shell_command_runs_and_a_rejected_one_does_not() {
     if !enabled("an_approved_shell_command_runs_and_a_rejected_one_does_not") {
         return;

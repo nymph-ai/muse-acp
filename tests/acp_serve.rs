@@ -12365,6 +12365,25 @@ fn unknown_kinds_render_fallback_text_only() {
 }
 
 #[test]
+fn fabric_keyed_text_marker_requires_v2_and_a_writable_receipt_store() {
+    let state = fresh_workspace_dir("keyed-text-unavailable");
+    let blocked = state.join("file-instead-of-state-directory");
+    std::fs::write(&blocked, b"").unwrap();
+    for (version, path, enabled) in [(1, &state, false), (2, &state, true), (2, &blocked, false)] {
+        let mut client = Client::spawn("quiet", &[("XDG_STATE_HOME", path.to_str().unwrap())]);
+        let id = client.req("initialize", &initialize_params(version, ""));
+        let reply = client.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let response: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(response["result"]["protocolVersion"], version);
+        assert_eq!(
+            response["result"]["_meta"]["nymph.ai/fabric"]["keyedTextPrompts"].as_bool(),
+            enabled.then_some(true),
+        );
+        client.finish();
+    }
+}
+
+#[test]
 fn v2_keyed_prompt_reuses_the_native_insertion_across_adapter_restart() {
     let state = fresh_state_dir();
     let state_path = state.to_str().expect("UTF-8 state path");

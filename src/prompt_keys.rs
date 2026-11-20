@@ -101,16 +101,30 @@ impl Key {
     }
 }
 
-fn session_dir(session: &str) -> io::Result<PathBuf> {
+fn receipt_root() -> io::Result<PathBuf> {
     let root = crate::modes::state_directory().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Muse ACP has no retained state directory",
         )
     })?;
-    Ok(root
-        .join("prompt-keys")
-        .join(crate::sha256::hex(session.as_bytes())))
+    Ok(root.join("prompt-keys"))
+}
+
+fn session_dir(session: &str) -> io::Result<PathBuf> {
+    Ok(receipt_root()?.join(crate::sha256::hex(session.as_bytes())))
+}
+
+/// Advertise keyed prompts only if the retained store can reserve a key.
+pub fn available() -> bool {
+    let Ok(dir) = receipt_root() else {
+        return false;
+    };
+    let probe = Key {
+        path: dir.join(format!(".probe-{}", std::process::id())),
+        fingerprint: String::new(),
+    };
+    probe.reserve(String::new()).is_ok() && probe.forget().is_ok()
 }
 
 pub fn forget_session(session: &str) {

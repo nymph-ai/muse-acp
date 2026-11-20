@@ -20,7 +20,8 @@ The fork's changes on top of upstream v0.25.0:
 | A message keeps one id live and on every replay: a user message the id of the turn command that inserted it, any other message its host item id (nymph-ai/nymphai#7283) | none yet |
 | No model selector while the host lists no model: a select with no option is not valid ACP v2 (nymph-ai/nymphai#7283) | none yet |
 | A `session/leave` rejected `runtime_busy`, retryable (Muse 1.4.18), is asked again, up to five times (nymph-ai/nymphai#7432) | none yet |
-| The adapter uses ACP Rust SDK 5.4.0. Plain-text ACP v2 keyed prompts use retained native command receipts. Keyed slash commands and unissued fork cursors return Invalid params before reaching the Muse host. | none yet |
+| The adapter uses ACP Rust SDK 5.4.0. Plain-text ACP v2 keyed prompts use retained native command receipts. ACP v2 initialization advertises Fabric's `keyedTextPrompts` when the receipt store is writable and the host is available. Keyed slash commands return Invalid params before reaching the Muse host. | none yet |
+| ACP v2 full replay issues fork cursors before user messages at verified native turn boundaries. The fork copies the preceding turns through `session/fork` with `cutPoint.lastTurnId`. The adapter retains issued cursor IDs alongside its local session state. | none yet |
 | Releases are published from `fabric` under fork tags, with no npm package (this file, `FORK_RELEASE`, `scripts/release.py`, the workflows) | fork only |
 
 An upstream pull is a courtesy. Nothing here waits for one to merge; when
