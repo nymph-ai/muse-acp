@@ -544,6 +544,89 @@ fn v2_keyed_prompt_reuses_its_real_msp_receipt_after_adapter_restart() {
 }
 
 #[test]
+fn v2_replays_from_an_issued_boundary_after_native_msp_replacement() {
+    if !enabled("v2_replays_from_an_issued_boundary_after_native_msp_replacement") {
+        return;
+    }
+    let host = Host::start(
+        json!({
+            "one": {"text": "first answer"}, "two": {"text": "second answer"}, "three": {"text": "third answer"}
+        }),
+        None,
+    );
+    let mut writer = Adapter::launch(&host);
+    let source = writer.new_session(&host, json!([]));
+    writer.turn(&source, "first prompt [[script:one]]");
+    writer.turn(&source, "second prompt [[script:two]]");
+    writer.finish();
+
+    let resume = |session: &str, replay: Value| json!({"sessionId": session, "cwd": host.workspace(), "replayFrom": replay});
+    let mut issuer = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let replay = issuer.request("session/resume", resume(&source, json!({"type":"start"})));
+    issuer.result(replay);
+    let cursor = issuer.updates("cursor_update").pop().unwrap();
+    let anchor = issuer.updates("user_message")[1]["messageId"].clone();
+    assert_eq!(cursor["anchor"]["messageId"], anchor);
+    issuer.finish();
+
+    let mut appender = Adapter::launch(&host);
+    let attached = appender.request("session/resume", resume(&source, Value::Null));
+    appender.result(attached);
+    appender.turn(&source, "third prompt [[script:three]]");
+    appender.finish();
+    let provider_log = host.dir.join("provider.log");
+    let calls = std::fs::read_to_string(&provider_log).unwrap();
+
+    let cursor_replay = |id: Value| json!({"type":"_fabric_cursor","cursorId":id});
+    let mut reader = Adapter::launch_protocol(&host, json!({}), &[], 2);
+    let other = reader.new_session(&host, json!([]));
+    for (session, cursor) in [
+        (&other, cursor_replay(cursor["cursorId"].clone())),
+        (&source, cursor_replay(json!("0".repeat(64)))),
+        (&source, cursor_replay(json!(17))),
+    ] {
+        let rejected = reader.request("session/resume", resume(session, cursor));
+        assert_eq!(reader.response(rejected)["error"]["code"], -32602);
+    }
+    assert!(reader.updates("user_message").is_empty());
+    let replay = reader.request(
+        "session/resume",
+        resume(&source, cursor_replay(cursor["cursorId"].clone())),
+    );
+    reader.result(replay);
+    let (output, _) = &*reader.frames;
+    let output = output.lock().unwrap();
+    let steps: Vec<_> = output
+        .frames
+        .iter()
+        .filter(|frame| frame["params"]["sessionId"] == source)
+        .filter_map(|frame| {
+            let update = frame.pointer("/params/update")?;
+            let text = update.pointer("/content/0/text").and_then(Value::as_str);
+            match update["sessionUpdate"].as_str()? {
+                "user_message" | "agent_message" => text,
+                "replay_complete" => Some("complete"),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "second prompt [[script:two]]",
+            "second answer",
+            "third prompt [[script:three]]",
+            "third answer",
+            "complete"
+        ]
+    );
+    drop(output);
+    assert_eq!(reader.updates("user_message")[0]["messageId"], anchor);
+    reader.finish();
+    assert_eq!(std::fs::read_to_string(provider_log).unwrap(), calls);
+}
+
+#[test]
 fn v2_forks_at_an_issued_boundary_in_real_msp_history() {
     if !enabled("v2_forks_at_an_issued_boundary_in_real_msp_history") {
         return;

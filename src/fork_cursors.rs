@@ -10,6 +10,7 @@ use crate::{json::J, modes, sha256};
 pub struct Boundary<'a> {
     pub id: String,
     pub anchor_message: &'a str,
+    pub index: usize,
     pub last_turn: &'a str,
 }
 
@@ -28,7 +29,7 @@ pub fn boundaries<'a>(acp_sid: &str, msp_sid: &str, items: &'a [J]) -> Vec<Bound
     let mut seen_items = HashSet::new();
     let mut seen_user_messages = HashSet::new();
     let mut exact_prefix = true;
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let next_turn = item.non_empty_str("turnId");
         let kind = item.non_empty_str("kind");
         let item_id = item.non_empty_str("itemId");
@@ -63,6 +64,7 @@ pub fn boundaries<'a>(acp_sid: &str, msp_sid: &str, items: &'a [J]) -> Vec<Bound
                 result.push(Boundary {
                     id: sha256::hex(&bytes),
                     anchor_message,
+                    index,
                     last_turn,
                 });
             }

@@ -44,6 +44,8 @@ pub struct SystemPrompt {
 pub enum Replay {
     /// `{"type":"start"}`: all retained history.
     Start,
+    /// An adapter-issued ACP cursor resolved against the retained native turn.
+    Cursor(String),
     /// A custom or future cursor type.
     Other(String),
 }
@@ -599,6 +601,12 @@ fn v2_capabilities(c: v2::schema::ClientCapabilities) -> ClientCapabilities {
 fn v2_replay(replay: v2::schema::ReplayFrom) -> Replay {
     match replay {
         v2::schema::ReplayFrom::Start(_) => Replay::Start,
+        v2::schema::ReplayFrom::Other(other) if other.type_ == "_fabric_cursor" => other
+            .fields
+            .get("cursorId")
+            .and_then(Value::as_str)
+            .map(|id| Replay::Cursor(id.to_owned()))
+            .unwrap_or(Replay::Other(other.type_)),
         v2::schema::ReplayFrom::Other(other) => Replay::Other(other.type_),
         _ => Replay::Other("unknown".to_string()),
     }

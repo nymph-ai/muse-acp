@@ -2130,7 +2130,9 @@ fn initialize_meta(muse: Option<&str>, keyed_text_prompts: bool) -> Option<out::
     let mut members: Vec<&str> = muse.into_iter().collect();
     members.push(r#""steering":{"supported":true,"idleBehaviors":["promptRequired"]}"#);
     if keyed_text_prompts {
-        members.push(r#""nymph.ai/fabric":{"keyedTextPrompts":true}"#);
+        members.push(
+            r#""nymph.ai/fabric":{"keyedTextPrompts":true,"replayFromCursor":"_fabric_cursor"}"#,
+        );
     }
     if AIR_CLIENT.load(Ordering::SeqCst) {
         members.push(
@@ -2612,16 +2614,15 @@ fn resume_model_override(meta: &request::Meta) -> Result<Option<String>, String>
 }
 
 /// Whether an ACP v2 `session/resume` asks for history replay. Omitted and
-/// `null` mean no replay; `{"type":"start"}` replays all retained history,
-/// the only cursor this adapter supports. The schema admits custom and
-/// future cursor types, which must be refused rather than replaced by
-/// another cursor.
+/// `null` mean no replay. `start` replays all retained history, and the
+/// Fabric extension names an issued cursor for inclusive replay. Other
+/// cursor types fail before native setup.
 fn resume_replay_from(replay: &Option<request::Replay>) -> Result<bool, String> {
     match replay {
         None => Ok(false),
-        Some(request::Replay::Start) => Ok(true),
+        Some(request::Replay::Start | request::Replay::Cursor(_)) => Ok(true),
         Some(request::Replay::Other(kind)) => Err(format!(
-            "unsupported replayFrom cursor type {}: this agent supports only {{\"type\":\"start\"}}",
+            "unsupported or malformed replayFrom cursor type {}",
             esc(kind)
         )),
     }
@@ -5953,6 +5954,21 @@ fn handle_acp(
                 .map(|s| s.msp_sid.clone())
                 .or(meta_msp_sid)
                 .unwrap_or_else(|| sid.clone());
+            let replay_cursor = match (&setup.replay_from, ver) {
+                (Some(request::Replay::Cursor(cursor)), 2) => {
+                    if !fork_cursors::was_issued(&msp_sid, &sid, cursor) {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "Muse has not issued this replay cursor for the session",
+                        );
+                        return;
+                    }
+                    Some(cursor.as_str())
+                }
+                _ => None,
+            };
             // Preserve the last delivered cursor before resume updates the
             // in-memory session. This is the anchor for an explicit suffix
             // replay on hosts that provide view/subscribe.
@@ -6053,6 +6069,22 @@ fn handle_acp(
                         );
                         return;
                     }
+                    let replay_start = if let Some(cursor) = replay_cursor {
+                        match replay_cursor_start(&sid, &real_msp, cursor, &r) {
+                            Some(index) if real_msp == msp_sid => index,
+                            _ => {
+                                acp::send_error(
+                                    stdout,
+                                    &id,
+                                    -32602,
+                                    "Muse no longer retains the exact replay cursor boundary",
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        0
+                    };
                     // A session Muse holds without a workspace (a side chat)
                     // refuses `workspaceRoots` with `workspace_not_composed`,
                     // so its roots stay with the host.
@@ -6259,7 +6291,7 @@ fn handle_acp(
                             // through a fresh fold.
                             let root = entry.fold.workspace_root.clone();
                             entry.fold = fresh_fold(&root);
-                            let complete = replay_history(stdout, entry, &r);
+                            let complete = replay_history(stdout, entry, &r, replay_start);
                             // ACP v2 marks the end of a requested replay, so
                             // the editor can tell history from live updates.
                             // A partial replay is left unmarked, which ACP
@@ -9050,16 +9082,16 @@ fn handle_acp(
 /// Inline items are preferred; snapshot-backed histories keep them under
 /// `history.snapshot.state.items`. Unknown shapes resume without replay
 /// (logged), never fail.
-fn replay_items(resume_res: &J) -> Option<Vec<J>> {
+fn replay_items(resume_res: &J) -> Option<&[J]> {
     let history = resume_res.get("history")?;
     match history.get("items") {
-        Some(J::Arr(items)) => Some(items.clone()),
+        Some(J::Arr(items)) => Some(items),
         _ => history
             .get("snapshot")
             .and_then(|snapshot| snapshot.get("state"))
             .and_then(|state| state.get("items"))
             .and_then(|items| match items {
-                J::Arr(items) => Some(items.clone()),
+                J::Arr(items) => Some(items.as_slice()),
                 _ => None,
             }),
     }
@@ -9202,24 +9234,54 @@ fn resolve_native_fork_cursor(
         .ok_or_else(|| "Muse no longer retains the exact fork cursor boundary".to_owned())
 }
 
+/// Check the anchor against the same complete snapshot used for emission.
+fn replay_cursor_start(
+    acp_sid: &str,
+    msp_sid: &str,
+    cursor: &str,
+    resume_res: &J,
+) -> Option<usize> {
+    if !inline_history(resume_res) {
+        return None;
+    }
+    fork_cursors::boundaries(acp_sid, msp_sid, replay_items(resume_res)?)
+        .into_iter()
+        .find(|boundary| boundary.id == cursor)
+        .map(|boundary| boundary.index)
+}
+
+fn inline_history(resume_res: &J) -> bool {
+    resume_res
+        .get("history")
+        .and_then(|history| history.non_empty_str("mode"))
+        == Some("inline")
+}
+
 /// Replays the history a `session/resume` result served. Returns whether
 /// the replay is complete: the host served the whole history inline, in a
 /// shape the fold reads. A downgraded or unreadable history replays what it
 /// can and answers false.
-fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) -> bool {
+fn replay_history(
+    stdout: &StdoutShared,
+    sess: &mut AcpSession,
+    resume_res: &J,
+    start: usize,
+) -> bool {
     let Some(items) = replay_items(resume_res) else {
         log("resume: unrecognized history shape; resumed without replay");
         return false;
     };
     let mut out = Vec::new();
     let (acp_sid, ver) = (sess.acp_sid.clone(), sess.ver);
+    if start > 0 {
+        // Keep earlier native entities known to the live fold without
+        // replaying those messages to a client that requested a suffix.
+        sess.fold
+            .replay_history_items(&acp_sid, ver, &items[..start], &mut Vec::new());
+    }
     sess.fold
-        .replay_history_items(&acp_sid, ver, &items, &mut out);
-    let complete = resume_res
-        .get("history")
-        .and_then(|h| h.get("mode"))
-        .and_then(J::as_str)
-        == Some("inline");
+        .replay_history_items(&acp_sid, ver, &items[start..], &mut out);
+    let complete = inline_history(resume_res);
     let user_messages = if complete && ver == 2 {
         use agent_client_protocol::v2::schema::SessionUpdate;
         out.iter()
@@ -9236,7 +9298,7 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     };
     acp::send_fold_lines(stdout, sess, out);
     if !user_messages.is_empty() {
-        for boundary in fork_cursors::boundaries(&acp_sid, &sess.msp_sid, &items) {
+        for boundary in fork_cursors::boundaries(&acp_sid, &sess.msp_sid, items) {
             if user_messages.contains(boundary.anchor_message) {
                 match fork_cursors::remember(&sess.msp_sid, &acp_sid, &boundary.id) {
                     Ok(()) => acp::send_note(
@@ -11917,7 +11979,7 @@ fn drill_down_subagent_child(
                     && let Some(fold) = s.child_folds.get_mut(&child)
                     && let Some(items) = replay_items(r)
                 {
-                    fold.replay_history_items(&target, ver, &items, &mut out);
+                    fold.replay_history_items(&target, ver, items, &mut out);
                 }
                 // AIR drops an update for a child session whose terminal
                 // state went out; its fold still saw the run, so a next
